@@ -5,21 +5,72 @@ import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 from dateutil import parser as dtparser
 
 from trello_client import decode_custom_fields, find_custom_value
 
-ENGENHEIROS = ["Gabriel", "Eduardo", "Joel", "Victor", "Neto", "Soares", "Gustavo"]
-ORCAMENTOS = ["César", "Cesar", "Simeone", "Laisa"]
+# -----------------------------------------------------------------------------
+# REGRAS OPERACIONAIS APROAR
+# -----------------------------------------------------------------------------
+# Gabriel acompanha a operação como supervisor geral. Ele NÃO é usado como
+# responsável padrão só porque está como membro do card.
+ENGENHEIROS = ["Eduardo", "Joel", "Victor", "Neto", "Soares", "Gustavo", "Gabriel"]
+ORCAMENTOS = ["César", "Cesar", "Simeone", "Laisa", "Helena", "Ariana"]
+
+RESPONSAVEL_POR_UNIDADE: list[tuple[tuple[str, ...], str, str]] = [
+    (("UNIFOR",), "UNIFOR", "Joel"),
+    (("HORIZONTE",), "HORIZONTE", "Soares"),
+    (("COLISEU",), "COLISEU", "Joel"),
+    (("MARACANAU",), "MARACANAÚ", "Neto"),
+    (("BARRA DO CEARA", "BARRA DO CEARÁ"), "BARRA DO CEARÁ", "Eduardo"),
+    (("MUSEU",), "MUSEU", "Victor"),
+    (("CASA DA INDUSTRIA", "CASA DA INDÚSTRIA", "FIEC"), "FIEC / CASA DA INDÚSTRIA", "Gustavo"),
+    # CENTRO fica depois de UNIFOR para não confundir "Centro de Convivência UNIFOR".
+    (("SENAI CENTRO", "SESI CENTRO"), "CENTRO", "Victor"),
+]
+
+# Handles/nome reais vistos no quadro. Ambos os "Neto" ficam normalizados para
+# o nome operacional usado pela equipe; a unidade continua sendo o principal
+# critério quando não há atribuição explícita.
+PESSOA_ALIASES = {
+    "EDUARDOROCHA APROAR": "Eduardo",
+    "EDUARDO ROCHA": "Eduardo",
+    "JOELLIMA43": "Joel",
+    "JOEL LIMA": "Joel",
+    "VICTORBEZERRA27": "Victor",
+    "VICTOR BEZERRA": "Victor",
+    "SOARES JUNIOR": "Soares",
+    "FRANCISCO SOARES": "Soares",
+    "GUSTAVODEHOLANDASOUZA": "Gustavo",
+    "GUSTAVO HOLANDA": "Gustavo",
+    "FRANCISCOASSISOLIVEIRANETO": "Neto",
+    "FRANCISCO ASSIS OLIVEIRA NETO": "Neto",
+    "RUPERTOCAVALCANTEPORTONETO1": "Neto",
+    "RUPERTO CAVALCANTE PORTO NETO": "Neto",
+    "GABRIELMONTEIRO340": "Gabriel",
+    "GABRIEL MONTEIRO": "Gabriel",
+}
 
 LISTA_PEND_CLIENTE = "SOLICITADOS PENDENCIAS CLIENTE"
 LISTA_SOLICITADOS = "SOLICITADOS"
 LISTA_PARA_ELABORAR = "PARA ELABORAR ORCAMENTO"
-LISTA_EM_ELABORACAO = "EM ELABORACAO"
+LISTA_EM_ELABORACAO = "EM ELABORACAO DE ORCAMENTO"
 LISTA_REVISAO = "REVISAO"
+LISTA_ENVIADO = "ENVIADO AO CLIENTE"
+LISTA_REVISAO_CLIENTE = "REVISAO CLIENTE"
+
+LISTAS_RADAR = {
+    LISTA_PEND_CLIENTE,
+    LISTA_SOLICITADOS,
+    LISTA_PARA_ELABORAR,
+    LISTA_EM_ELABORACAO,
+    LISTA_REVISAO,
+    LISTA_ENVIADO,
+    LISTA_REVISAO_CLIENTE,
+}
 
 
 @dataclass
@@ -28,11 +79,27 @@ class RadarResult:
     queues: dict[str, pd.DataFrame]
 
 
+@dataclass
+class TechRule:
+    label: str
+    check: Callable[[str, dict[str, Any]], bool]
+
+
+# -----------------------------------------------------------------------------
+# TEXTO / DATAS
+# -----------------------------------------------------------------------------
 def norm(text: Any) -> str:
     value = unicodedata.normalize("NFD", str(text or ""))
     value = "".join(ch for ch in value if unicodedata.category(ch) != "Mn")
     value = re.sub(r"[^A-Z0-9]+", " ", value.upper()).strip()
     return re.sub(r"\s+", " ", value)
+
+
+def flat(text: Any) -> str:
+    """Maiúsculo, sem acento, mas preserva pontuação/unidades para regex."""
+    value = unicodedata.normalize("NFD", str(text or ""))
+    value = "".join(ch for ch in value if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", value.upper()).strip()
 
 
 def parse_dt(value: Any) -> datetime | None:
@@ -59,34 +126,28 @@ def yes(value: Any) -> bool:
 
 
 def member_name_map(members: list[dict[str, Any]]) -> dict[str, str]:
-    return {str(member.get("id")): str(member.get("fullName") or member.get("username") or "") for member in members}
+    return {
+        str(member.get("id")): str(member.get("fullName") or member.get("username") or "")
+        for member in members
+    }
 
 
-def identify_engineer(card: dict[str, Any], custom: dict[str, Any], members_by_id: dict[str, str]) -> str:
-    custom_owner = find_custom_value(custom, "engenheiro", "supervisor de obra", "responsavel levantamento", "responsável levantamento")
-    if custom_owner:
-        custom_text = str(custom_owner)
-        for engineer in ENGENHEIROS:
-            if norm(engineer) in norm(custom_text):
-                return engineer
-        return custom_text
-
-    names = [members_by_id.get(str(mid), "") for mid in card.get("idMembers") or []]
-    for engineer in ENGENHEIROS:
-        if any(norm(engineer) in norm(name) for name in names):
+def alias_to_engineer(value: Any) -> str | None:
+    text = norm(value)
+    if not text:
+        return None
+    for alias, engineer in PESSOA_ALIASES.items():
+        if norm(alias) in text:
             return engineer
-    return ", ".join(name for name in names if name) or "Não identificado"
+    for engineer in ENGENHEIROS:
+        if norm(engineer) in text:
+            return engineer
+    return None
 
 
-def identify_budget_owner(custom: dict[str, Any], card: dict[str, Any], members_by_id: dict[str, str]) -> str:
-    value = find_custom_value(custom, "responsavel pela elaboracao", "responsável pela elaboração", "elaborador", "orcamentista", "orçamentista")
-    if value:
-        return str(value)
-    names = [members_by_id.get(str(mid), "") for mid in card.get("idMembers") or []]
-    selected = [name for name in names if any(norm(person) in norm(name) for person in ORCAMENTOS)]
-    return ", ".join(selected) or "Não definido"
-
-
+# -----------------------------------------------------------------------------
+# AÇÕES / COMENTÁRIOS
+# -----------------------------------------------------------------------------
 def action_card_id(action: dict[str, Any]) -> str:
     return str(((action.get("data") or {}).get("card") or {}).get("id") or "")
 
@@ -98,24 +159,15 @@ def index_actions(actions: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
         if cid:
             indexed[cid].append(action)
     for cid in indexed:
-        indexed[cid].sort(key=lambda a: parse_dt(a.get("date")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        indexed[cid].sort(
+            key=lambda a: parse_dt(a.get("date")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
     return indexed
 
 
-def current_list_entry(card: dict[str, Any], card_actions: list[dict[str, Any]], list_by_id: dict[str, str]) -> datetime | None:
-    current_id = str(card.get("idList") or "")
-    for action in card_actions:
-        data = action.get("data") or {}
-        after = data.get("listAfter") or {}
-        if str(after.get("id") or "") == current_id:
-            dt = parse_dt(action.get("date"))
-            if dt:
-                return dt
-    return None
-
-
-def latest_comment(card_actions: list[dict[str, Any]]) -> dict[str, Any] | None:
-    return next((a for a in card_actions if str(a.get("type")) == "commentCard"), None)
+def comment_actions(card_actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [a for a in card_actions if str(a.get("type")) == "commentCard"]
 
 
 def comment_author(action: dict[str, Any] | None) -> str:
@@ -131,18 +183,620 @@ def comment_text(action: dict[str, Any] | None) -> str:
     return str(((action.get("data") or {}).get("text")) or "")
 
 
-def waiting_owner(list_name: str, description: str, labels: list[dict[str, Any]], custom: dict[str, Any]) -> str:
-    haystack = " ".join([list_name, description] + [str(label.get("name") or "") for label in labels] + [f"{k} {v}" for k, v in custom.items()])
-    text = norm(haystack)
-    if "PENDENCIA CLIENTE" in text or norm(list_name) == LISTA_PEND_CLIENTE:
-        return "Cliente"
-    if "FORNECEDOR" in text or "PRESTADOR" in text:
-        return "Fornecedor"
-    if "ESPECIALISTA" in text:
-        return "Especialista"
-    return "Engenharia"
+def comment_date(action: dict[str, Any] | None) -> datetime | None:
+    return parse_dt(action.get("date")) if action else None
 
 
+def current_list_entry(card: dict[str, Any], card_actions: list[dict[str, Any]]) -> datetime | None:
+    current_id = str(card.get("idList") or "")
+    for action in card_actions:
+        after = (action.get("data") or {}).get("listAfter") or {}
+        if str(after.get("id") or "") == current_id:
+            dt = parse_dt(action.get("date"))
+            if dt:
+                return dt
+    return None
+
+
+def engineer_from_comment_author(action: dict[str, Any]) -> str | None:
+    creator = action.get("memberCreator") or {}
+    full = str(creator.get("fullName") or "")
+    username = str(creator.get("username") or "")
+    return alias_to_engineer(f"{full} {username}")
+
+
+def is_office_author(action: dict[str, Any]) -> bool:
+    author = norm(comment_author(action))
+    return any(norm(person) in author for person in ORCAMENTOS)
+
+
+def mentioned_engineers(text: str) -> list[str]:
+    found: list[tuple[int, str]] = []
+    source = norm(text)
+    for alias, engineer in PESSOA_ALIASES.items():
+        pos = source.find(norm(alias))
+        if pos >= 0:
+            found.append((pos, engineer))
+    # também cobre @victor, @eduardo etc.
+    for engineer in ENGENHEIROS:
+        pos = source.find(norm(engineer))
+        if pos >= 0:
+            found.append((pos, engineer))
+    result: list[str] = []
+    for _, name in sorted(found, key=lambda x: x[0]):
+        if name not in result:
+            result.append(name)
+    return result
+
+
+ASSIGNMENT_WORDS = {
+    "MARCAR", "VISITA", "LEVANTAMENTO", "ORCAR", "ORCAMENTO", "VERIFICAR",
+    "EXPLICAR", "INFORMAR", "ENVIAR", "COBRAR", "REALIZAR", "CONFERIR",
+    "COMPLEMENTAR", "ACRESCENTAR", "CORRIGIR", "ANEXAR", "COTACAO",
+}
+
+
+def explicit_assignment(card_actions: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    """Atribuição explícita em comentário vence a regra da unidade."""
+    for action in comment_actions(card_actions):
+        text = comment_text(action)
+        text_norm = norm(text)
+        mentions = mentioned_engineers(text)
+        if not mentions:
+            continue
+        if any(word in text_norm for word in ASSIGNMENT_WORDS):
+            return mentions[0], text
+    return None, None
+
+
+# -----------------------------------------------------------------------------
+# UNIDADE / RESPONSABILIDADE
+# -----------------------------------------------------------------------------
+def identify_unit(card: dict[str, Any]) -> tuple[str, str | None]:
+    haystack = f" {norm(card.get('name'))} {norm(card.get('desc'))} "
+    for aliases, display, engineer in RESPONSAVEL_POR_UNIDADE:
+        for alias in aliases:
+            needle = f" {norm(alias)} "
+            if needle in haystack:
+                return display, engineer
+    return "NÃO MAPEADA", None
+
+
+def identify_engineer(
+    card: dict[str, Any],
+    custom: dict[str, Any],
+    card_actions: list[dict[str, Any]],
+    members_by_id: dict[str, str],
+) -> tuple[str, str]:
+    # 1) Campo dedicado, se um dia for criado no board.
+    custom_owner = find_custom_value(
+        custom,
+        "engenheiro",
+        "supervisor de obra",
+        "responsavel levantamento",
+        "responsável levantamento",
+    )
+    if custom_owner:
+        identified = alias_to_engineer(custom_owner)
+        if identified:
+            return identified, "Campo do Trello"
+
+    # 2) Atribuição explícita em comentário.
+    assigned, _ = explicit_assignment(card_actions)
+    if assigned:
+        return assigned, "Atribuição explícita"
+
+    # 3) Regra fixa da unidade informada pela operação.
+    _, unit_owner = identify_unit(card)
+    if unit_owner:
+        return unit_owner, "Responsável da unidade"
+
+    # 4) Se unidade não estiver mapeada, usa autor de retorno técnico recente.
+    for action in comment_actions(card_actions):
+        engineer = engineer_from_comment_author(action)
+        if engineer and engineer != "Gabriel":
+            return engineer, "Autor de retorno"
+
+    # 5) Fallback de membros, MAS nunca transforma Gabriel em responsável só
+    # porque ele acompanha praticamente todo o quadro.
+    names = [members_by_id.get(str(mid), "") for mid in card.get("idMembers") or []]
+    for name in names:
+        engineer = alias_to_engineer(name)
+        if engineer and engineer != "Gabriel":
+            return engineer, "Membro do card (fallback)"
+
+    return "Não identificado", "Sem responsável detectável"
+
+
+def identify_budget_owner(custom: dict[str, Any], card: dict[str, Any], members_by_id: dict[str, str]) -> str:
+    value = find_custom_value(
+        custom,
+        "responsavel pela elaboracao",
+        "responsável pela elaboração",
+        "resp elaboracao",
+        "resp. elaboracao",
+        "elaborador",
+        "orcamentista",
+        "orçamentista",
+    )
+    if value:
+        return str(value)
+    names = [members_by_id.get(str(mid), "") for mid in card.get("idMembers") or []]
+    selected = [name for name in names if any(norm(person) in norm(name) for person in ["César", "Simeone", "Laisa"])]
+    return ", ".join(selected) or "Não definido"
+
+
+# -----------------------------------------------------------------------------
+# SINAIS DE RETORNO / COBRANÇA
+# -----------------------------------------------------------------------------
+ATTACHMENT_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+
+
+def strip_attachment_markup(text: str) -> str:
+    text = ATTACHMENT_RE.sub("", str(text or ""))
+    text = re.sub(r"https?://\S+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def is_generic_visit_request(text: str) -> bool:
+    t = norm(text)
+    return "MARCAR O DIA E REALIZAR A VISITA" in t and "LEVANTAMENTO DO ESCOPO" in t
+
+
+def engineer_comments(card_actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [a for a in comment_actions(card_actions) if engineer_from_comment_author(a)]
+
+
+def office_requests_to_engineer(card_actions: list[dict[str, Any]], engineer: str) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for action in comment_actions(card_actions):
+        if not is_office_author(action) and "GABRIEL" not in norm(comment_author(action)):
+            continue
+        text = comment_text(action)
+        mentions = mentioned_engineers(text)
+        if engineer != "Não identificado" and mentions and engineer not in mentions:
+            continue
+        t = norm(text)
+        looks_like_request = bool(mentions and any(word in t for word in ASSIGNMENT_WORDS)) or "?" in text
+        if looks_like_request:
+            output.append(action)
+    return output
+
+
+def comments_after(actions: list[dict[str, Any]], moment: datetime | None) -> list[dict[str, Any]]:
+    if not moment:
+        return actions
+    return [a for a in actions if (comment_date(a) or datetime.min.replace(tzinfo=timezone.utc)) > moment]
+
+
+def latest_engineer_response(card_actions: list[dict[str, Any]], engineer: str) -> dict[str, Any] | None:
+    for action in engineer_comments(card_actions):
+        who = engineer_from_comment_author(action)
+        if engineer == "Não identificado" or who == engineer:
+            return action
+    return None
+
+
+# -----------------------------------------------------------------------------
+# CONFERÊNCIA DE PERGUNTAS OBJETIVAS
+# -----------------------------------------------------------------------------
+def has_number_with_unit(text: str) -> bool:
+    t = flat(text)
+    return bool(re.search(r"\b\d+(?:[\.,]\d+)?\s*(?:M2|M²|M\b|CM\b|MM\b|METROS?|CENTIMETROS?|MILIMETROS?)", t))
+
+
+def has_area(text: str) -> bool:
+    t = flat(text)
+    return bool(
+        re.search(r"\b\d+(?:[\.,]\d+)?\s*(?:M2|M²|METROS? QUADRADOS?)\b", t)
+        or re.search(r"\b(?:AREA|ÁREA)\b.{0,30}\d", t)
+        or re.search(r"\d+(?:[\.,]\d+)?\s*[Xx]\s*\d+(?:[\.,]\d+)?", t)
+    )
+
+
+def has_height(text: str) -> bool:
+    t = flat(text)
+    return bool(
+        re.search(r"ALTURA.{0,25}\d+(?:[\.,]\d+)?\s*(?:M|CM|MM|METRO)", t)
+        or re.search(r"\bH\s*[=:]?\s*\d+(?:[\.,]\d+)?\s*M\b", t)
+        or ("ANDAIME" in t or "PLATAFORMA" in t) and has_number_with_unit(t)
+    )
+
+
+def has_quantity(text: str) -> bool:
+    t = flat(text)
+    return bool(
+        re.search(r"\b(?:TOTAL|QTD|QUANTIDADE)\b.{0,20}\d+", t)
+        or re.search(
+            r"\b\d+\s*(?:UN|UND|UNID|UNIDADE|UNIDADES|PECAS?|PORTAS?|POSTES?|LUMINARIAS?|PLACAS?|TAMPAS?|PONTOS?|SENSORES?|REGISTROS?|JANELAS?)\b",
+            t,
+        )
+    )
+
+
+def has_finish(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in ["FOSCO", "ACETINADO", "SEMI BRILHO", "SEMIBRILHO", "BRILHANTE", "ALTO BRILHO", "TEXTURIZADO"])
+
+
+def has_paint_type_or_color(text: str) -> bool:
+    t = norm(text)
+    words = [
+        "TINTA", "ACRILICA", "PVA", "EPOXI", "ESMALTE", "COR ", "BRANCO", "BRANCA",
+        "AZUL", "CINZA", "PRETO", "PRETA", "VERDE", "AMARELO", "BEGE", "OCEANO",
+    ]
+    return any(x in t for x in words)
+
+
+def has_preparation(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in [
+        "LIX", "EMASS", "RASP", "ESCARIFIC", "SELADOR", "FUNDO PREPARADOR", "LIMPEZA",
+        "REMOCAO", "DEMOL", "REBOCO", "REGULARIZ", "PREPARACAO", "TRATAMENTO",
+    ])
+
+
+def has_material(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in [
+        "ALUMINIO", "ACO", "FERRO", "INOX", "VIDRO", "GRANITO", "MARMORE", "ACRILICO",
+        "CERAMIC", "PORCELANATO", "DRYWALL", "GESSO", "CONCRETO", "ARGAMASSA", "TINTA",
+        "TELHA", "MADEIRA", "PVC", "BORRACHA", "RESINA", "PERFIL", "CHAPA", "PASTILHA",
+    ])
+
+
+def has_model_spec(text: str) -> bool:
+    t = norm(text)
+    return has_material(t) or any(x in t for x in [
+        "MODELO", "MARCA", "REFERENCIA", "ESPECIFICACAO", "DIAMETRO", "BITOLA", "ESPESSURA",
+        "POTENCIA", "TENSAO", "VOLTAGEM", "COR ", "TIPO ", "DIMENSAO",
+    ])
+
+
+def has_shutdown(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in ["DESATIV", "DESLIG", "ENERGIA", "QUADRO", "INTERDICAO", "BLOQUEIO ELETRICO"])
+
+
+def has_access(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in ["ANDAIME", "PLATAFORMA", "ESCADA", "ACESSO", "ALTURA", "NR 35", "TRABALHO EM ALTURA"])
+
+
+def has_dimensions(text: str) -> bool:
+    t = flat(text)
+    return has_number_with_unit(t) or bool(re.search(r"\d+(?:[\.,]\d+)?\s*[Xx]\s*\d+(?:[\.,]\d+)?", t))
+
+
+def has_thickness(text: str) -> bool:
+    t = flat(text)
+    return bool(
+        re.search(r"ESPESSURA.{0,20}\d+(?:[\.,]\d+)?\s*(?:MM|CM|M)", t)
+        or re.search(r"CAMADA.{0,20}\d+(?:[\.,]\d+)?\s*(?:MM|CM)", t)
+        or re.search(r"\b\d+(?:[\.,]\d+)?\s*(?:MM|CM)\b", t)
+    )
+
+
+def has_diagnosis(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in [
+        "ORIGEM", "CAUSA", "DIAGNOST", "INFILTR", "VAZAMENTO", "UMIDADE", "TRINCA", "FISSURA",
+        "CORROSAO", "AFUND", "SOLT", "DANIFIC", "OXID", "DESPLAC",
+    ])
+
+
+def has_solution(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in [
+        "RETIR", "REMOV", "SUBSTIT", "INSTAL", "RECOMP", "EXECUT", "APLIC", "PINT",
+        "IMPERMEABIL", "REGULARIZ", "TRAT", "FIX", "SOLD", "REPAR", "COMPACT", "ATERRO",
+        "DESATIV", "REINSTAL", "CONFECC", "FORNEC", "MONT",
+    ])
+
+
+def explicit_unknown(text: str) -> bool:
+    t = norm(text)
+    return any(x in t for x in ["A CONFIRMAR", "NAO DEFINIDO", "NAO DEFINIDA", "AGUARDANDO INFORMACAO", "DEPENDE DO CLIENTE", "PRECISA CONFIRMAR"])
+
+
+REQUEST_CHECKS: list[tuple[tuple[str, ...], str, Callable[[str], bool]]] = [
+    (("ACABAMENTO",), "Acabamento", lambda x: has_finish(x) or explicit_unknown(x)),
+    (("ALTURA",), "Altura", lambda x: has_height(x) or explicit_unknown(x)),
+    (("AREA", "METROS QUADRADOS"), "Área", lambda x: has_area(x) or explicit_unknown(x)),
+    (("MEDIDA", "DIMENSAO", "DIMENSOES", "COMPRIMENTO", "LARGURA"), "Medidas/dimensões", lambda x: has_dimensions(x) or explicit_unknown(x)),
+    (("QUANTIDADE", "QTD", "QUANTOS", "QUANTAS"), "Quantidade", lambda x: has_quantity(x) or explicit_unknown(x)),
+    (("ESPESSURA",), "Espessura", lambda x: has_thickness(x) or explicit_unknown(x)),
+    (("QUAL COR", "COR DA TINTA", "COR DO MATERIAL"), "Cor", lambda x: has_paint_type_or_color(x) or explicit_unknown(x)),
+    (("TIPO DE TINTA", "QUAL TINTA", "ESPECIFICACAO DA TINTA"), "Tipo de tinta", lambda x: has_paint_type_or_color(x) or explicit_unknown(x)),
+    (("MATERIAL", "ESPECIFICACAO", "MODELO", "REFERENCIA"), "Material/especificação", lambda x: has_model_spec(x) or explicit_unknown(x)),
+    (("ANDAIME", "ACESSO", "PLATAFORMA"), "Condição de acesso", lambda x: has_access(x) or explicit_unknown(x)),
+]
+
+
+def requested_fields(question: str) -> list[tuple[str, Callable[[str], bool]]]:
+    q = f" {norm(question)} "
+    found: list[tuple[str, Callable[[str], bool]]] = []
+    for needles, label, check in REQUEST_CHECKS:
+        if any(norm(n) in q for n in needles):
+            if label not in [x[0] for x in found]:
+                found.append((label, check))
+    return found
+
+
+def unresolved_specific_request(card_actions: list[dict[str, Any]], engineer: str) -> tuple[str | None, list[str], datetime | None]:
+    """
+    Procura a cobrança objetiva mais recente e confere se a resposta posterior
+    realmente contém o dado perguntado. Ex.: pergunta 'qual o acabamento?' e
+    resposta 'emassamento, lixamento e pintura' continua pendente.
+    """
+    requests = office_requests_to_engineer(card_actions, engineer)
+    eng_comments = engineer_comments(card_actions)
+    for request in requests:
+        q_text = strip_attachment_markup(comment_text(request))
+        q_dt = comment_date(request)
+        fields = requested_fields(q_text)
+        subsequent = comments_after(eng_comments, q_dt)
+        if engineer != "Não identificado":
+            subsequent = [a for a in subsequent if engineer_from_comment_author(a) == engineer]
+
+        if not subsequent:
+            if is_generic_visit_request(q_text):
+                return "Agendar/realizar a visita e preencher o levantamento", ["Visita/levantamento ainda sem retorno"], q_dt
+            return q_text[:280] or "Responder a solicitação do setor de Orçamentos", [], q_dt
+
+        answer_text = " \n ".join(comment_text(a) for a in subsequent)
+        missing = [label for label, check in fields if not check(answer_text)]
+        if fields and missing:
+            return f"Resposta recebida, mas ainda não informa: {', '.join(missing)}", missing, q_dt
+        # Se era cobrança genérica e houve retorno, deixa a avaliação técnica geral decidir.
+        if fields:
+            return None, [], q_dt
+    return None, [], None
+
+
+# -----------------------------------------------------------------------------
+# SINAIS DE TERCEIROS
+# -----------------------------------------------------------------------------
+def third_party_signal(card_actions: list[dict[str, Any]]) -> tuple[str | None, str | None, datetime | None]:
+    """Só considera 'aguardando terceiro' quando já existe sinal de que a ação foi disparada."""
+    for action in comment_actions(card_actions):
+        text = norm(comment_text(action))
+        author_eng = engineer_from_comment_author(action)
+
+        supplier_wait = any(x in text for x in [
+            "AGUARDANDO ORCAMENTO DO FORNECEDOR", "AGUARDANDO ORCAMENTO FORNECEDOR",
+            "AGUARDANDO COTACAO", "AGUARDANDO RETORNO DO FORNECEDOR", "AGUARDANDO FORNECEDOR",
+            "VISITA DO FORNECEDOR", "FORNECEDOR FOI VERIFICAR", "FORNECEDOR JA FOI",
+        ])
+        if supplier_wait and author_eng:
+            return "Fornecedor", strip_attachment_markup(comment_text(action))[:260], comment_date(action)
+
+        client_wait = any(x in text for x in [
+            "AGUARDANDO CLIENTE", "AGUARDANDO RETORNO DO CLIENTE", "PENDENTE CLIENTE",
+            "CLIENTE VAI CONFIRMAR", "CLIENTE IRA CONFIRMAR",
+        ])
+        if client_wait:
+            return "Cliente", strip_attachment_markup(comment_text(action))[:260], comment_date(action)
+
+        specialist_wait = any(x in text for x in [
+            "AGUARDANDO ESPECIALISTA", "AGUARDANDO PROJETO", "AGUARDANDO PROJETISTA",
+            "AGUARDANDO ENGENHEIRO ELETRICO", "AGUARDANDO ESTRUTURAL",
+        ])
+        if specialist_wait:
+            return "Especialista", strip_attachment_markup(comment_text(action))[:260], comment_date(action)
+    return None, None, None
+
+
+# -----------------------------------------------------------------------------
+# REGRAS TÉCNICAS POR SERVIÇO
+# -----------------------------------------------------------------------------
+def detect_service_type(card: dict[str, Any], technical_text: str) -> str:
+    title = norm(card.get("name"))
+    full = norm(f"{card.get('name','')} {card.get('desc','')} {technical_text}")
+
+    def has_word(word: str) -> bool:
+        return bool(re.search(rf"\b{re.escape(norm(word))}\b", full))
+
+    if has_word("GARANTIA"):
+        return "Garantia"
+    if any(x in full for x in ["INFILTR", "VAZAMENTO", "IMPERMEABIL"]):
+        return "Infiltração / impermeabilização"
+    if any(x in full for x in ["PINTURA", "PINTAR", "EMASSAMENTO", "LIXAMENTO"]):
+        return "Pintura"
+    if any(x in full for x in ["SOLEIRA", "RODAPE"]):
+        return "Soleira / rodapé"
+    if any(x in full for x in ["CERAMIC", "PISO", "REVESTIMENTO", "PORCELANATO"]):
+        return "Piso / revestimento"
+    if has_word("PORTA") or has_word("PORTAS") or any(x in full for x in ["VIDRO", "JANELA", "ESQUADRIA", "CILINDRO"]):
+        return "Porta / vidro / esquadria"
+    if any(x in full for x in ["GRADIL", "PORTAO", "GRADE METAL", "ESTRUTURA METAL", "SOLD"]):
+        return "Serralheria / gradil / portão"
+    if any(x in full for x in ["POSTE", "LUMINARIA", "ELETRIC", "ILUMINACAO", "FIBRA", "CABEAMENTO"]):
+        return "Elétrica / iluminação"
+    if any(x in full for x in ["DRYWALL", "DRY WALL", "FORRO", "GESSO"]):
+        return "Drywall / forro"
+    if any(x in full for x in ["ARMADURA", "REBOCO", "CONCRETO", "ARGAMASSA ESTRUTURAL", "LAJE"]):
+        return "Concreto / reboco / armadura"
+    if any(x in full for x in ["COBERTURA", "COBERTA", "TELHA"]):
+        return "Cobertura"
+    if "ACRILICO" in full:
+        return "Acrílico"
+    if any(x in full for x in ["MARMORE", "MARMORARIA", "GRANITO", "BANCADA"]):
+        return "Marmoraria"
+    if any(x in full for x in ["SENSOR", "BEBEDOURO", "EQUIPAMENTO"]):
+        return "Equipamento"
+    return "Outros"
+
+
+def attachment_names(card: dict[str, Any]) -> str:
+    return " ".join(str(a.get("name") or a.get("fileName") or "") for a in card.get("attachments") or [])
+
+
+def tech_rules(service: str, card: dict[str, Any]) -> list[TechRule]:
+    always_unknown_ok = lambda check: (lambda text, c: check(text) or explicit_unknown(text))
+    has_attachment = lambda text, c: bool(c.get("attachments")) or "ANEX" in norm(text)
+
+    if service == "Pintura":
+        return [
+            TechRule("Área/dimensões da pintura", always_unknown_ok(has_area)),
+            TechRule("Altura/condição de acesso", lambda t, c: has_height(t) or has_access(t) or explicit_unknown(t)),
+            TechRule("Preparação da superfície", always_unknown_ok(has_preparation)),
+            TechRule("Tipo/cor da tinta", always_unknown_ok(has_paint_type_or_color)),
+            TechRule("Acabamento da tinta", always_unknown_ok(has_finish)),
+        ]
+    if service == "Infiltração / impermeabilização":
+        return [
+            TechRule("Origem/diagnóstico do problema", always_unknown_ok(has_diagnosis)),
+            TechRule("Área/dimensões afetadas", lambda t, c: has_area(t) or has_dimensions(t) or explicit_unknown(t)),
+            TechRule("Solução/sistema previsto", always_unknown_ok(has_solution)),
+            TechRule("Remoções e recomposições necessárias", lambda t, c: has_preparation(t) or "RECOMP" in norm(t) or explicit_unknown(t)),
+        ]
+    if service == "Soleira / rodapé":
+        return [
+            TechRule("Comprimento/quantidade", lambda t, c: has_dimensions(t) or has_quantity(t) or explicit_unknown(t)),
+            TechRule("Material/padrão", always_unknown_ok(has_material)),
+            TechRule("Dimensões/seção da peça", always_unknown_ok(has_dimensions)),
+            TechRule("Condição da base/remoção existente", lambda t, c: has_preparation(t) or "BASE" in norm(t) or explicit_unknown(t)),
+        ]
+    if service == "Piso / revestimento":
+        return [
+            TechRule("Área/quantidade", lambda t, c: has_area(t) or has_quantity(t) or explicit_unknown(t)),
+            TechRule("Tipo/dimensão do revestimento", lambda t, c: has_material(t) and (has_dimensions(t) or "TIPO" in norm(t)) or explicit_unknown(t)),
+            TechRule("Base/preparo", lambda t, c: has_preparation(t) or "CONTRAPISO" in norm(t) or "BASE" in norm(t) or explicit_unknown(t)),
+            TechRule("Remoção/recomposição", lambda t, c: any(x in norm(t) for x in ["REMOV", "RETIR", "RECOMP", "MANTER EXISTENTE", "SEM REMOCAO"]) or explicit_unknown(t)),
+        ]
+    if service == "Porta / vidro / esquadria":
+        return [
+            TechRule("Quantidade de peças", lambda t, c: has_quantity(t) or explicit_unknown(t)),
+            TechRule("Medidas", always_unknown_ok(has_dimensions)),
+            TechRule("Material/modelo/especificação", always_unknown_ok(has_model_spec)),
+            TechRule("Ferragens/acessórios/reaproveitamento", lambda t, c: any(x in norm(t) for x in ["FERRAGEM", "DOBRAD", "PUXADOR", "FECHADURA", "CILINDRO", "ROLDANA", "TRILHO", "REAPROVEIT", "ACESSORIO"]) or explicit_unknown(t)),
+        ]
+    if service == "Serralheria / gradil / portão":
+        return [
+            TechRule("Comprimento/quantidade", lambda t, c: has_dimensions(t) or has_quantity(t) or explicit_unknown(t)),
+            TechRule("Altura/dimensões", always_unknown_ok(has_dimensions)),
+            TechRule("Material/perfil", always_unknown_ok(has_model_spec)),
+            TechRule("Fixação/remoção/reinstalação", lambda t, c: any(x in norm(t) for x in ["FIX", "REMOV", "RETIR", "REINSTAL", "SOLD", "CHUMB", "PARAFUS"]) or explicit_unknown(t)),
+            TechRule("Acabamento/proteção", lambda t, c: has_finish(t) or any(x in norm(t) for x in ["PINT", "GALVAN", "ANTICORROS", "FUNDO"]) or explicit_unknown(t)),
+        ]
+    if service == "Elétrica / iluminação":
+        rules = [
+            TechRule("Quantidade", lambda t, c: has_quantity(t) or explicit_unknown(t)),
+            TechRule("Especificação dos equipamentos/materiais", always_unknown_ok(has_model_spec)),
+            TechRule("Desligamento/desativação", always_unknown_ok(has_shutdown)),
+            TechRule("Interferências/dependências", lambda t, c: any(x in norm(t) for x in ["FIBRA", "INTERFER", "DEPEND", "OUTRA REDE", "ENERGIA", "ALIMENTA"]) or explicit_unknown(t)),
+        ]
+        if any(x in norm(card.get("name")) for x in ["POSTE", "LUMINARIA"]):
+            rules.insert(2, TechRule("Altura/condição de acesso", lambda t, c: has_height(t) or has_access(t) or explicit_unknown(t)))
+        if "POSTE" in norm(f"{card.get('name')} {card.get('desc')}") and any(x in norm(f"{card.get('desc')} {attachment_names(card)}") for x in ["SUBSTIT", "NOVO POSTE"]):
+            rules.append(TechRule("Especificação do poste substituto", lambda t, c: "POSTE" in norm(t) and has_model_spec(t) and has_dimensions(t) or explicit_unknown(t)))
+        return rules
+    if service == "Drywall / forro":
+        return [
+            TechRule("Área/dimensões", lambda t, c: has_area(t) or has_dimensions(t) or explicit_unknown(t)),
+            TechRule("Tipo/material da placa", always_unknown_ok(has_model_spec)),
+            TechRule("Estrutura/perfis", lambda t, c: any(x in norm(t) for x in ["PERFIL", "MONTANTE", "GUIA", "ESTRUTURA"]) or explicit_unknown(t)),
+            TechRule("Acabamento", lambda t, c: any(x in norm(t) for x in ["MASSA", "FITA", "PINT", "ACABAMENTO"]) or explicit_unknown(t)),
+            TechRule("Interferências", lambda t, c: any(x in norm(t) for x in ["ELETR", "AR COND", "SPRINKLER", "LUMINARIA", "INTERFER", "SEM INTERFERENCIA"]) or explicit_unknown(t)),
+        ]
+    if service == "Concreto / reboco / armadura":
+        return [
+            TechRule("Área/dimensões", lambda t, c: has_area(t) or has_dimensions(t) or explicit_unknown(t)),
+            TechRule("Espessura/profundidade", always_unknown_ok(has_thickness)),
+            TechRule("Remoção/preparo", always_unknown_ok(has_preparation)),
+            TechRule("Tratamento/material de recomposição", lambda t, c: has_material(t) or "TRAT" in norm(t) or "RECOMP" in norm(t) or explicit_unknown(t)),
+            TechRule("Acabamento final", lambda t, c: has_finish(t) or any(x in norm(t) for x in ["PINT", "CERAMIC", "REVEST", "ACABAMENTO"]) or explicit_unknown(t)),
+        ]
+    if service == "Cobertura":
+        return [
+            TechRule("Área/dimensões", lambda t, c: has_area(t) or has_dimensions(t) or explicit_unknown(t)),
+            TechRule("Sistema/material", always_unknown_ok(has_model_spec)),
+            TechRule("Estrutura/fixação", lambda t, c: any(x in norm(t) for x in ["ESTRUTURA", "PERFIL", "VIGA", "PILAR", "FIX", "CHUMB", "PARAFUS"]) or explicit_unknown(t)),
+            TechRule("Projeto/anexo de referência", has_attachment),
+        ]
+    if service == "Acrílico":
+        return [
+            TechRule("Quantidade", lambda t, c: has_quantity(t) or explicit_unknown(t)),
+            TechRule("Medidas", always_unknown_ok(has_dimensions)),
+            TechRule("Espessura", always_unknown_ok(has_thickness)),
+            TechRule("Tipo/cor/transparência", lambda t, c: any(x in norm(t) for x in ["TRANSPAREN", "CRISTAL", "FUME", "LEITOSO", "COLORIDO", "COR "]) or explicit_unknown(t)),
+        ]
+    if service == "Marmoraria":
+        return [
+            TechRule("Quantidade/peças", lambda t, c: has_quantity(t) or explicit_unknown(t)),
+            TechRule("Medidas", always_unknown_ok(has_dimensions)),
+            TechRule("Material/padrão", always_unknown_ok(has_material)),
+            TechRule("Acabamento", lambda t, c: any(x in norm(t) for x in ["POLID", "LEVIG", "BOLEAD", "ACABAMENTO", "BRILHO"]) or explicit_unknown(t)),
+            TechRule("Instalação/remoção", lambda t, c: any(x in norm(t) for x in ["INSTAL", "REMOV", "RETIR", "FIX", "COLA"]) or explicit_unknown(t)),
+        ]
+    if service == "Equipamento":
+        return [
+            TechRule("Quantidade", lambda t, c: has_quantity(t) or explicit_unknown(t)),
+            TechRule("Modelo/especificação", always_unknown_ok(has_model_spec)),
+            TechRule("Local/ponto de instalação", lambda t, c: any(x in norm(t) for x in ["LOCAL", "TERREO", "SALA", "PORTARIA", "PONTO", "ACADEMIA"]) or explicit_unknown(t)),
+            TechRule("Condição de instalação/alimentação", lambda t, c: any(x in norm(t) for x in ["INSTAL", "ALIMENT", "TOMADA", "TENSAO", "ENERGIA", "FIX"]) or explicit_unknown(t)),
+        ]
+    if service == "Garantia":
+        return [
+            TechRule("Referência do serviço/orçamento anterior", lambda t, c: any(x in norm(t) for x in ["OBRA ", "PIPE", "ORCAMENTO ANTERIOR", "SERVICO ANTERIOR"]) or explicit_unknown(t)),
+            TechRule("Fornecedor/responsável pela garantia", lambda t, c: any(x in norm(t) for x in ["FORNECEDOR", "PRESTADOR", "GARANTIA COM", "RESPONSAVEL"]) or explicit_unknown(t)),
+            TechRule("Defeito/diagnóstico", lambda t, c: has_diagnosis(t) or any(x in norm(t) for x in ["NAO GEL", "MOTOR", "DEFEITO", "NAO FUNCIONA"]) or explicit_unknown(t)),
+            TechRule("Providência/acionamento", lambda t, c: any(x in norm(t) for x in ["ACION", "AGEND", "VISITA FORNECEDOR", "TROCA", "REPARO"]) or explicit_unknown(t)),
+        ]
+    return [
+        TechRule("Escopo/solução do serviço", always_unknown_ok(has_solution)),
+        TechRule("Medidas/quantidades", lambda t, c: has_dimensions(t) or has_quantity(t) or explicit_unknown(t)),
+        TechRule("Materiais/especificações", always_unknown_ok(has_model_spec)),
+        TechRule("Condições de execução/dependências", lambda t, c: any(x in norm(t) for x in ["ACESSO", "INTERFER", "RESTRICAO", "DESLIG", "ANDAIME", "FORNECEDOR", "CLIENTE", "DEPEND"]) or explicit_unknown(t)),
+    ]
+
+
+def technical_assessment(card: dict[str, Any], card_actions: list[dict[str, Any]]) -> tuple[str, list[str], list[str], bool, str]:
+    eng = engineer_comments(card_actions)
+    engineer_text = " \n ".join(strip_attachment_markup(comment_text(a)) for a in reversed(eng))
+    source_text = " \n ".join([str(card.get("desc") or ""), attachment_names(card), engineer_text])
+    service = detect_service_type(card, engineer_text)
+    rules = tech_rules(service, card)
+    informed: list[str] = []
+    missing: list[str] = []
+    for rule in rules:
+        try:
+            ok = bool(rule.check(source_text, card))
+        except Exception:
+            ok = False
+        (informed if ok else missing).append(rule.label)
+
+    substantive_reply = False
+    for action in eng:
+        text = strip_attachment_markup(comment_text(action))
+        t = norm(text)
+        if not text:
+            continue
+        if any(x in t for x in ["AGUARDANDO", "FOI SOLICITADO", "VOU COBRAR", "VISITA MARCADA"]):
+            # é retorno operacional, mas não necessariamente levantamento técnico
+            if has_dimensions(text) or has_quantity(text) or has_model_spec(text) or has_solution(text):
+                substantive_reply = True
+                break
+            continue
+        if len(text) >= 25 and (
+            has_dimensions(text)
+            or has_quantity(text)
+            or has_model_spec(text)
+            or has_solution(text)
+            or has_diagnosis(text)
+            or has_preparation(text)
+        ):
+            substantive_reply = True
+            break
+
+    summary = ", ".join(informed[:4]) if informed else "Nenhuma informação técnica objetiva identificada"
+    return service, informed, missing, substantive_reply, summary
+
+
+# -----------------------------------------------------------------------------
+# PRAZOS / STATUS
+# -----------------------------------------------------------------------------
 def due_status(due: Any, now: datetime) -> tuple[str, int | None]:
     dt = parse_dt(due)
     if not dt:
@@ -157,24 +811,7 @@ def due_status(due: Any, now: datetime) -> tuple[str, int | None]:
     return f"Em {delta_days}d", delta_days
 
 
-def missing_reasons(list_name: str, custom: dict[str, Any], engineer: str) -> list[str]:
-    reasons: list[str] = []
-    visit = find_custom_value(custom, "data da visita", "visita realizada", "data visita")
-    info = find_custom_value(custom, "informacoes preenchidas", "informações preenchidas", "levantamento preenchido")
-
-    if engineer == "Não identificado":
-        reasons.append("Responsável da Engenharia não identificado")
-    if not visit:
-        reasons.append("Visita realizada não registrada")
-    if info is not None and not yes(info):
-        reasons.append("Informações ainda não marcadas como preenchidas")
-    if norm(list_name) == LISTA_SOLICITADOS and info is None:
-        reasons.append("Levantamento ainda sem confirmação de preenchimento")
-    return reasons
-
-
 def manual_review_signal(custom: dict[str, Any]) -> bool:
-    # Se o board ganhar um campo específico no futuro, o painel passa a entendê-lo sem alterar IDs.
     value = find_custom_value(
         custom,
         "conferido por orcamentos",
@@ -187,6 +824,15 @@ def manual_review_signal(custom: dict[str, Any]) -> bool:
     return yes(value)
 
 
+def status_marks_incomplete(custom: dict[str, Any]) -> bool:
+    value = find_custom_value(custom, "status")
+    t = norm(value)
+    return any(x in t for x in ["INFORMACAO AUSENTE", "INCOMPLETO", "NECESSIDADE DE AJUSTES"])
+
+
+# -----------------------------------------------------------------------------
+# MOTOR PRINCIPAL
+# -----------------------------------------------------------------------------
 def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = False) -> RadarResult:
     now = datetime.now(timezone.utc)
     lists = snapshot.get("lists") or []
@@ -201,86 +847,191 @@ def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = F
 
     rows: list[dict[str, Any]] = []
     for card in cards:
-        list_name = list_by_id.get(str(card.get("idList")), "Lista não identificada")
+        list_name = list_by_id.get(str(card.get("idList")), "")
         list_norm = norm(list_name)
-        # O radar operacional não precisa poluir a tela com execução/concluído/medições.
-        if any(term in list_norm for term in ["CONCLUID", "EM EXECUCAO", "APROVADO AGUARDANDO EXECUCAO", "MEDICAO"]):
+
+        # Evita reproduzir o Trello inteiro: somente as etapas do funil de orçamento.
+        if list_norm not in LISTAS_RADAR:
             continue
 
         custom = decode_custom_fields(card, custom_fields)
         card_actions = actions_by_card.get(str(card.get("id")), [])
-        engineer = identify_engineer(card, custom, members_by_id)
+        comments = comment_actions(card_actions)
+        latest = comments[0] if comments else None
+
+        unit, _ = identify_unit(card)
+        engineer, engineer_source = identify_engineer(card, custom, card_actions, members_by_id)
         budget_owner = identify_budget_owner(custom, card, members_by_id)
-        owner = waiting_owner(list_name, str(card.get("desc") or ""), card.get("labels") or [], custom)
-        reasons = missing_reasons(list_name, custom, engineer)
+
         info_value = find_custom_value(custom, "informacoes preenchidas", "informações preenchidas", "levantamento preenchido")
         info_yes = yes(info_value)
+        visit_value = find_custom_value(custom, "data visita", "data da visita", "visita realizada")
+        status_value = find_custom_value(custom, "status")
         reviewed = manual_review_signal(custom)
-        latest = latest_comment(card_actions)
-        latest_author = comment_author(latest)
-        latest_text = comment_text(latest)
-        latest_dt = parse_dt(latest.get("date")) if latest else None
-        engineer_replied = bool(latest and any(norm(e) in norm(latest_author) for e in ENGENHEIROS))
-        entered = current_list_entry(card, card_actions, list_by_id)
+
+        service, informed, missing, substantive_reply, technical_summary = technical_assessment(card, card_actions)
+        specific_pending, specific_missing, specific_request_dt = unresolved_specific_request(card_actions, engineer)
+        third_owner, third_note, third_dt = third_party_signal(card_actions)
+
+        latest_eng = latest_engineer_response(card_actions, engineer)
+        latest_eng_dt = comment_date(latest_eng)
+        latest_request = office_requests_to_engineer(card_actions, engineer)
+        latest_request_dt = comment_date(latest_request[0]) if latest_request else None
+
+        entered = current_list_entry(card, card_actions)
         age_days = max(0, (now - entered).days) if entered else None
-        status_due, delta_due = due_status(card.get("due"), now)
+
+        # O campo customizado "Prazo:" é usado como prazo original quando existe.
+        due_value = find_custom_value(custom, "prazo") or card.get("due")
+        received_value = find_custom_value(custom, "recebido em") or card.get("start")
+        status_due, delta_due = due_status(due_value, now)
 
         queue = "Acompanhar"
+        waiting = "—"
         pending = ""
 
-        if owner != "Engenharia":
+        # 1) A etapa do Trello é a primeira verdade. Isso impede que cards enviados
+        # ao cliente caiam em "Cobrar Engenharia" só por terem campos vazios.
+        if list_norm == LISTA_PEND_CLIENTE:
             queue = "Aguardar terceiros"
-            pending = f"Aguardando {owner.lower()}"
-        elif reviewed and list_norm == LISTA_PARA_ELABORAR:
-            queue = "Pronto para elaborar"
-            pending = "Levantamento conferido"
-        elif trust_trello_ready_list and list_norm == LISTA_PARA_ELABORAR:
-            queue = "Pronto para elaborar"
-            pending = "Lista do Trello considerada como liberação"
-        elif list_norm == LISTA_PARA_ELABORAR or info_yes or engineer_replied:
-            queue = "Conferir retorno"
-            pending = "Validar se o retorno/levantamento está suficiente"
-        elif list_norm == LISTA_SOLICITADOS or reasons:
-            queue = "Cobrar Engenharia"
-            pending = "; ".join(reasons) if reasons else "Levantamento pendente"
+            waiting = "Cliente"
+            pending = "Aguardando informação/definição do cliente"
+        elif list_norm in {LISTA_ENVIADO, LISTA_REVISAO_CLIENTE}:
+            queue = "Aguardar terceiros"
+            waiting = "Cliente"
+            pending = "Acompanhar retorno/revisão do cliente"
         elif list_norm in {LISTA_EM_ELABORACAO, LISTA_REVISAO}:
             queue = "Em produção"
-            pending = "Orçamento em elaboração/revisão"
+            waiting = "Orçamentos"
+            pending = "Orçamento em elaboração/revisão interna"
+        elif list_norm == LISTA_PARA_ELABORAR:
+            waiting = "Orçamentos"
+            if reviewed or trust_trello_ready_list:
+                queue = "Pronto para elaborar"
+                pending = "Levantamento liberado para elaboração"
+            else:
+                queue = "Conferir retorno"
+                pending = (
+                    "Conferir levantamento antes de liberar"
+                    + (f" • possíveis lacunas: {', '.join(missing[:4])}" if missing else "")
+                )
+        elif list_norm == LISTA_SOLICITADOS:
+            # 2) Resolve a ordem temporal entre uma cobrança interna e uma espera
+            # externa. Se o supervisor respondeu depois dizendo que já acionou o
+            # fornecedor, a demanda passa a aguardar fornecedor. Se Orçamentos
+            # cobrou algo depois disso, volta para Engenharia.
+            request_is_newer = bool(
+                specific_pending and specific_request_dt and (not third_dt or specific_request_dt > third_dt)
+            )
+            third_is_current = bool(
+                third_owner and third_dt and (not specific_request_dt or third_dt >= specific_request_dt)
+            )
+
+            if request_is_newer:
+                queue = "Cobrar Engenharia"
+                waiting = "Engenharia"
+                pending = specific_pending or "Responder à solicitação de Orçamentos"
+            elif third_is_current:
+                queue = "Aguardar terceiros"
+                waiting = third_owner or "Terceiro"
+                pending = third_note or f"Aguardando {(third_owner or 'terceiro').lower()}"
+            # 3) Se o próprio Trello já marcou incompleto/ajustes, volta para cobrança.
+            elif status_marks_incomplete(custom):
+                queue = "Cobrar Engenharia"
+                waiting = "Engenharia"
+                pending = specific_pending or (
+                    f"Complementar levantamento: {', '.join((specific_missing or missing)[:5])}"
+                    if (specific_missing or missing)
+                    else f"Status do Trello: {status_value}"
+                )
+            # 4) Uma pergunta objetiva ainda não respondida (ou respondida sem o dado)
+            # permanece em cobrança. Este é o caso 'acabamento da tinta' / 'altura'.
+            elif specific_pending:
+                queue = "Cobrar Engenharia"
+                waiting = "Engenharia"
+                pending = specific_pending
+            # 5) Houve levantamento/resposta técnica: passa para conferência humana,
+            # exibindo lacunas prováveis em vez de liberar automaticamente.
+            elif substantive_reply or info_yes:
+                queue = "Conferir retorno"
+                waiting = "Orçamentos"
+                pending = "Conferir retorno recebido"
+                if missing:
+                    pending += f" • possíveis lacunas: {', '.join(missing[:5])}"
+            else:
+                queue = "Cobrar Engenharia"
+                waiting = "Engenharia"
+                if engineer == "Não identificado":
+                    pending = "Definir responsável pelo levantamento"
+                elif not visit_value:
+                    pending = "Agendar/realizar visita e enviar levantamento"
+                else:
+                    pending = "Enviar informações técnicas do levantamento"
+                if missing:
+                    pending += f" • cobrar: {', '.join(missing[:4])}"
 
         rows.append({
             "Fila": queue,
             "Demanda": str(card.get("name") or "Sem título"),
             "Etapa Trello": list_name,
+            "Unidade": unit,
             "Engenharia": engineer,
+            "Fonte responsável": engineer_source,
+            "Tipo de serviço": service,
             "Pendência / próxima ação": pending,
-            "Aguardando": owner,
-            "Prazo": fmt_date(card.get("due")),
+            "Possíveis lacunas": "; ".join((specific_missing or missing)[:8]) if (specific_missing or missing) else "—",
+            "Já identificado": "; ".join(informed[:8]) if informed else "—",
+            "Aguardando": waiting,
+            "Prazo": fmt_date(due_value),
             "Situação do prazo": status_due,
             "Dias até prazo": delta_due,
+            "Recebido em": fmt_date(received_value),
+            "Data visita": fmt_date(visit_value),
             "Tempo na etapa (dias)": age_days,
-            "Último comentário": latest_text[:180] if latest_text else "—",
-            "Autor último comentário": latest_author or "—",
-            "Último comentário em": latest_dt.astimezone().strftime("%d/%m %H:%M") if latest_dt else "—",
+            "Último comentário": strip_attachment_markup(comment_text(latest))[:300] if latest else "—",
+            "Autor último comentário": comment_author(latest) or "—",
+            "Último comentário em": comment_date(latest).astimezone().strftime("%d/%m %H:%M") if comment_date(latest) else "—",
+            "Último retorno Engenharia": strip_attachment_markup(comment_text(latest_eng))[:300] if latest_eng else "—",
             "Responsável elaboração": budget_owner,
             "Informações preenchidas": "Sim" if info_yes else "Não/sem informação",
+            "Status Trello": str(status_value or "—"),
             "Revisão manual": "Sim" if reviewed else "Não",
-            "URL": str(card.get("url") or ""),
+            "Resumo técnico": technical_summary,
+            "URL": str(card.get("url") or card.get("shortUrl") or ""),
             "Card ID": str(card.get("id") or ""),
+            "_Última solicitação": latest_request_dt,
+            "_Último retorno": latest_eng_dt,
         })
 
     columns = [
-        "Fila", "Demanda", "Etapa Trello", "Engenharia", "Pendência / próxima ação", "Aguardando",
-        "Prazo", "Situação do prazo", "Dias até prazo", "Tempo na etapa (dias)", "Último comentário",
-        "Autor último comentário", "Último comentário em", "Responsável elaboração", "Informações preenchidas",
-        "Revisão manual", "URL", "Card ID",
+        "Fila", "Demanda", "Etapa Trello", "Unidade", "Engenharia", "Fonte responsável",
+        "Tipo de serviço", "Pendência / próxima ação", "Possíveis lacunas", "Já identificado",
+        "Aguardando", "Prazo", "Situação do prazo", "Dias até prazo", "Recebido em", "Data visita",
+        "Tempo na etapa (dias)", "Último comentário", "Autor último comentário", "Último comentário em",
+        "Último retorno Engenharia", "Responsável elaboração", "Informações preenchidas", "Status Trello",
+        "Revisão manual", "Resumo técnico", "URL", "Card ID", "_Última solicitação", "_Último retorno",
     ]
     df = pd.DataFrame(rows, columns=columns)
     if not df.empty:
         df["_prioridade_prazo"] = df["Dias até prazo"].fillna(9999)
-        df = df.sort_values(["_prioridade_prazo", "Tempo na etapa (dias)"], ascending=[True, False], na_position="last").drop(columns="_prioridade_prazo")
+        queue_order = {
+            "Cobrar Engenharia": 0,
+            "Conferir retorno": 1,
+            "Pronto para elaborar": 2,
+            "Aguardar terceiros": 3,
+            "Em produção": 4,
+            "Acompanhar": 5,
+        }
+        df["_ord_fila"] = df["Fila"].map(queue_order).fillna(9)
+        df = df.sort_values(
+            ["_ord_fila", "_prioridade_prazo", "Tempo na etapa (dias)"],
+            ascending=[True, True, False],
+            na_position="last",
+        ).drop(columns=["_prioridade_prazo", "_ord_fila"])
 
+    queue_names = ["Cobrar Engenharia", "Conferir retorno", "Pronto para elaborar", "Aguardar terceiros", "Em produção"]
     queues = {
         name: df[df["Fila"] == name].copy() if not df.empty else pd.DataFrame(columns=columns)
-        for name in ["Cobrar Engenharia", "Conferir retorno", "Pronto para elaborar", "Aguardar terceiros", "Em produção"]
+        for name in queue_names
     }
     return RadarResult(rows=df, queues=queues)
