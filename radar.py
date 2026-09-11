@@ -1229,3 +1229,178 @@ def reconcile_review_states(df: pd.DataFrame, states: dict[str, dict[str, Any]])
                 out.at[idx, 'Aguardando'] = 'Orçamentos'
                 out.at[idx, 'Pendência / próxima ação'] = 'Levantamento aceito por ' + str(state.get('accepted_by') or 'Orçamentos')
     return out
+import json
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+
+LOCAL_TZ = ZoneInfo("America/Fortaleza")
+
+
+def reconcile_review_states(df, states):
+    """Combina as decisões de Orçamentos com os retornos do Trello."""
+    out = df.copy()
+
+    for column in [
+        "Última cobrança",
+        "Prazo resposta",
+        "Situação resposta",
+        "Aceito por",
+    ]:
+        out[column] = "—"
+
+    out["Dias resposta"] = float("nan")
+
+    def timestamp(value):
+        return pd.to_datetime(value, utc=True, errors="coerce")
+
+    def format_date(value):
+        parsed = timestamp(value)
+        if pd.isna(parsed):
+            return "—"
+        return parsed.tz_convert(LOCAL_TZ).strftime("%d/%m/%Y")
+
+    for idx, row in out.iterrows():
+        card_id = str(row.get("Card ID") or "")
+        state = (states or {}).get(card_id) or {}
+
+        raw = state.get("pending_reason")
+        try:
+            payload = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+            if not isinstance(payload, dict):
+                payload = {}
+        except (ValueError, TypeError):
+            payload = {"items": [str(raw)]} if raw else {}
+
+        items = payload.get("items") or []
+        if isinstance(items, str):
+            items = [items]
+
+        supervisor = payload.get("supervisor")
+        if supervisor:
+            out.at[idx, "Engenharia"] = supervisor
+            out.at[idx, "Fonte responsável"] = "Definido por Orçamentos"
+
+        if state.get("budget_owner"):
+            out.at[idx, "Responsável elaboração"] = state["budget_owner"]
+
+        out.at[idx, "Última cobrança"] = format_date(
+            state.get("last_chase_at")
+        )
+        out.at[idx, "Aceito por"] = state.get("accepted_by") or "—"
+
+        response_due = payload.get("response_due")
+
+        # Uma data de calendário deve permanecer no dia escolhido.
+        if response_due and len(str(response_due)) == 10:
+            response_due = str(response_due) + "T12:00:00-03:00"
+
+        due = timestamp(response_due)
+
+        if pd.notna(due):
+            local_due = due.tz_convert(LOCAL_TZ).date()
+            today = datetime.now(LOCAL_TZ).date()
+            days = (local_due - today).days
+
+            out.at[idx, "Prazo resposta"] = local_due.strftime("%d/%m/%Y")
+            out.at[idx, "Dias resposta"] = days
+
+            if days < 0:
+                label = f"Atrasado há {abs(days)} dia(s)"
+            elif days == 0:
+                label = "Hoje"
+            else:
+                label = f"Em {days} dia(s)"
+
+            out.at[idx, "Situação resposta"] = label
+        else:
+            out.at[idx, "Situação resposta"] = "Sem prazo"
+
+        # Não trazer uma demanda de etapa avançada para a fila inicial.
+        stage = norm(row.get("Etapa Trello"))
+        if stage not in {LISTA_SOLICITADOS, LISTA_PARA_ELABORAR}:
+            continue
+
+        request = timestamp(row.get("_Última solicitação"))
+        response = timestamp(row.get("_Atualização Engenharia"))
+
+        # Compatibilidade com a coluna das versões anteriores do radar.
+        if pd.isna(response):
+            response = timestamp(row.get("_Último retorno"))
+
+        accepted = timestamp(state.get("accepted_at"))
+        definition = timestamp(payload.get("saved_at"))
+        chase = timestamp(state.get("last_chase_at"))
+
+        reference_dates = [
+            value
+            for value in [definition, chase, request]
+            if pd.notna(value)
+        ]
+        reference = max(reference_dates) if reference_dates else pd.NaT
+
+        status = state.get("review_status")
+
+        if status == "waiting_engineering":
+            has_new_response = (
+                pd.notna(response)
+                and (pd.isna(reference) or response > reference)
+            )
+
+            if pd.isna(reference) or has_new_response:
+                out.at[idx, "Fila"] = "Conferir retorno"
+                out.at[idx, "Aguardando"] = "Orçamentos"
+                out.at[idx, "Pendência / próxima ação"] = (
+                    "Conferir retorno frente aos itens solicitados"
+                )
+            else:
+                out.at[idx, "Fila"] = "Cobrar Engenharia"
+                out.at[idx, "Aguardando"] = "Engenharia"
+                out.at[idx, "Pendência / próxima ação"] = (
+                    "Solicitar: " + "; ".join(map(str, items))
+                    if items
+                    else "Definir os itens que o engenheiro precisa responder"
+                )
+
+        elif status == "accepted":
+            newer_request = (
+                pd.notna(request)
+                and (pd.isna(accepted) or request > accepted)
+            )
+            newer_response = (
+                pd.notna(response)
+                and (pd.isna(accepted) or response > accepted)
+            )
+
+            if newer_request:
+                if pd.notna(response) and response > request:
+                    out.at[idx, "Fila"] = "Conferir retorno"
+                    out.at[idx, "Aguardando"] = "Orçamentos"
+                    out.at[idx, "Pendência / próxima ação"] = (
+                        "Conferir retorno à solicitação posterior ao aceite"
+                    )
+                else:
+                    out.at[idx, "Fila"] = "Cobrar Engenharia"
+                    out.at[idx, "Aguardando"] = "Engenharia"
+                    out.at[idx, "Pendência / próxima ação"] = (
+                        "Cobrar a solicitação registrada após o aceite"
+                    )
+
+            elif pd.isna(accepted) or newer_response:
+                out.at[idx, "Fila"] = "Conferir retorno"
+                out.at[idx, "Aguardando"] = "Orçamentos"
+                out.at[idx, "Pendência / próxima ação"] = (
+                    "Conferir atualização ou confirmar aceite sem data"
+                )
+
+            else:
+                out.at[idx, "Fila"] = "Pronto para elaborar"
+                out.at[idx, "Aguardando"] = "Orçamentos"
+                out.at[idx, "Pendência / próxima ação"] = (
+                    "Levantamento aceito por "
+                    + str(state.get("accepted_by") or "Orçamentos")
+                )
+
+    return out
