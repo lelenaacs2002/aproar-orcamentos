@@ -2215,4 +2215,3 @@ def reconcile_review_states(df, states):
                 )
 
     return out
-```
