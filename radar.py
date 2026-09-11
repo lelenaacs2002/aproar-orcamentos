@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import json
+from zoneinfo import ZoneInfo
 import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
@@ -11,6 +13,8 @@ import pandas as pd
 from dateutil import parser as dtparser
 
 from trello_client import decode_custom_fields, find_custom_value
+
+LOCAL_TZ = ZoneInfo('America/Fortaleza')
 
 # -----------------------------------------------------------------------------
 # REGRAS OPERACIONAIS APROAR
@@ -106,7 +110,7 @@ def parse_dt(value: Any) -> datetime | None:
     if not value:
         return None
     try:
-        dt = dtparser.isoparse(str(value))
+        dt = value if isinstance(value, datetime) else dtparser.isoparse(str(value))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
@@ -116,7 +120,7 @@ def parse_dt(value: Any) -> datetime | None:
 
 def fmt_date(value: Any) -> str:
     dt = parse_dt(value)
-    return dt.astimezone().strftime("%d/%m/%Y") if dt else "—"
+    return dt.astimezone(LOCAL_TZ).strftime("%d/%m/%Y") if dt else "—"
 
 
 def yes(value: Any) -> bool:
@@ -247,6 +251,8 @@ REQUEST_SIGNAL_WORDS = ASSIGNMENT_WORDS | {
 def explicit_assignment(card_actions: list[dict[str, Any]]) -> tuple[str | None, str | None]:
     """Atribuição explícita em comentário vence a regra da unidade."""
     for action in comment_actions(card_actions):
+        if not is_office_author(action):
+            continue
         text = comment_text(action)
         text_norm = norm(text)
         mentions = mentioned_engineers(text)
@@ -423,6 +429,8 @@ def office_ready_signal(card_actions: list[dict[str, Any]]) -> tuple[str | None,
             continue
         text = strip_attachment_markup(comment_text(action))
         t = norm(text)
+        if re.search(r'\b(NAO|AINDA|SE|QUANDO|APOS|FALTA|PENDENTE)\b', t):
+            continue
         if any(phrase in t for phrase in ready_phrases):
             return text[:280], comment_date(action)
     return None, None
@@ -857,7 +865,7 @@ def due_status(due: Any, now: datetime) -> tuple[str, int | None]:
     dt = parse_dt(due)
     if not dt:
         return "Sem prazo", None
-    delta_days = (dt.astimezone().date() - now.astimezone().date()).days
+    delta_days = (dt.astimezone(LOCAL_TZ).date() - now.astimezone(LOCAL_TZ).date()).days
     if delta_days < 0:
         return f"Atrasado {abs(delta_days)}d", delta_days
     if delta_days == 0:
@@ -894,7 +902,7 @@ def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = F
     lists = snapshot.get("lists") or []
     cards = snapshot.get("cards") or []
     members = snapshot.get("members") or []
-    custom_fields = snapshot.get("custom_fields") or []
+    custom_fields = snapshot.get("custom_fields") or snapshot.get("customFields") or []
     actions = snapshot.get("actions") or []
 
     list_by_id = {str(item.get("id")): str(item.get("name") or "") for item in lists}
@@ -903,6 +911,8 @@ def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = F
 
     rows: list[dict[str, Any]] = []
     for card in cards:
+        if card.get('closed'):
+            continue
         list_name = list_by_id.get(str(card.get("idList")), "")
         list_norm = norm(list_name)
 
@@ -1063,6 +1073,26 @@ def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = F
                 if missing:
                     pending += f" • cobrar: {', '.join(missing[:4])}"
 
+        # O retorno precisa ser visto por uma pessoa, inclusive quando a heurística
+        # acha que ele não respondeu tudo. Nomes de anexos não provam seu conteúdo.
+        eng_updates = [a for a in card_actions if
+                       str(a.get('type')) in {'commentCard', 'addAttachmentToCard', 'updateCustomFieldItem'}
+                       and engineer_from_comment_author(a) == engineer]
+        latest_update = comment_date(eng_updates[0]) if eng_updates else latest_eng_dt
+        if list_norm in {LISTA_SOLICITADOS, LISTA_PARA_ELABORAR}:
+            if latest_update and (not latest_request_dt or latest_update > latest_request_dt):
+                if third_dt and third_dt == latest_update:
+                    queue, waiting, pending = 'Aguardar terceiros', third_owner or 'Terceiro', third_note or 'Conferir dependência'
+                else:
+                    queue, waiting = 'Conferir retorno', 'Orçamentos'
+                    pending = 'Novo retorno/anexo recebido. Conferir antes de cobrar novamente.'
+            elif latest_request_dt and (not ready_dt or latest_request_dt > ready_dt):
+                queue, waiting = 'Cobrar Engenharia', 'Engenharia'
+                pending = specific_pending or 'Responder à última solicitação de Orçamentos'
+            # Campo preenchido e frases livres são indícios, não aceite rastreável.
+            if queue == 'Pronto para elaborar':
+                queue, waiting, pending = 'Conferir retorno', 'Orçamentos', 'Confirmar a liberação indicada no Trello'
+
         rows.append({
             "Fila": queue,
             "Demanda": str(card.get("name") or "Sem título"),
@@ -1084,7 +1114,12 @@ def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = F
             "Último comentário": strip_attachment_markup(comment_text(latest))[:300] if latest else "—",
             "Autor último comentário": comment_author(latest) or "—",
             "Último comentário em": comment_date(latest).astimezone().strftime("%d/%m %H:%M") if comment_date(latest) else "—",
-            "Último retorno Engenharia": strip_attachment_markup(comment_text(latest_eng))[:300] if latest_eng else "—",
+            "Último retorno Engenharia": comment_text(latest_eng) if latest_eng else "—",
+            "_Atualização Engenharia": latest_update,
+            "_Atualização relevante": comment_date(card_actions[0]) if card_actions else None,
+            "_Comentários": [{"autor": comment_author(a), "data": str(a.get('date') or ''), "texto": comment_text(a)} for a in comments],
+            "_Descrição": str(card.get('desc') or ''),
+            "_Anexos": [{"nome": str(a.get('name') or 'Anexo'), "url": str(a.get('url') or '')} for a in card.get('attachments') or []],
             "Responsável elaboração": budget_owner,
             "Informações preenchidas": "Sim" if info_yes else "Não/sem informação",
             "Status Trello": str(status_value or "—"),
@@ -1097,6 +1132,7 @@ def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = F
         })
 
     columns = [
+        "_Atualização Engenharia", "_Atualização relevante", "_Comentários", "_Descrição", "_Anexos",
         "Fila", "Demanda", "Etapa Trello", "Unidade", "Engenharia", "Fonte responsável",
         "Tipo de serviço", "Pendência / próxima ação", "Possíveis lacunas", "Já identificado",
         "Aguardando", "Prazo", "Situação do prazo", "Dias até prazo", "Recebido em", "Data visita",
@@ -1128,3 +1164,68 @@ def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = F
         for name in queue_names
     }
     return RadarResult(rows=df, queues=queues)
+
+
+def reconcile_review_states(df: pd.DataFrame, states: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    """Decisões do painel + evidências do Trello, sem retroceder etapas avançadas."""
+    out = df.copy()
+    for name in ['Última cobrança', 'Prazo resposta', 'Situação resposta', 'Aceito por']:
+        out[name] = '—'
+    out['Dias resposta'] = float('nan')
+    for idx, row in out.iterrows():
+        state = states.get(str(row.get('Card ID')), {})
+        try:
+            payload = json.loads(state.get('pending_reason') or '{}')
+            if not isinstance(payload, dict):
+                payload = {}
+        except (ValueError, TypeError):
+            payload = {}
+        if payload.get('supervisor'):
+            out.at[idx, 'Engenharia'] = payload['supervisor']
+            out.at[idx, 'Fonte responsável'] = 'Definido por Orçamentos'
+        if state.get('budget_owner'):
+            out.at[idx, 'Responsável elaboração'] = state['budget_owner']
+        out.at[idx, 'Última cobrança'] = fmt_date(state.get('last_chase_at'))
+        response_due = payload.get('response_due')
+        # Prazo escolhido no calendário é uma data civil, não meia-noite UTC.
+        if response_due and len(str(response_due)) == 10:
+            response_due = str(response_due) + 'T12:00:00-03:00'
+        out.at[idx, 'Prazo resposta'] = fmt_date(response_due)
+        out.at[idx, 'Aceito por'] = state.get('accepted_by') or '—'
+        status, days = due_status(response_due, datetime.now(timezone.utc))
+        out.at[idx, 'Situação resposta'], out.at[idx, 'Dias resposta'] = status, days
+        if norm(row.get('Etapa Trello')) not in {LISTA_SOLICITADOS, LISTA_PARA_ELABORAR}:
+            continue
+        def timestamp(value):
+            return pd.to_datetime(value, utc=True, errors='coerce')
+        request = timestamp(row.get('_Última solicitação'))
+        response = timestamp(row.get('_Atualização Engenharia', row.get('_Último retorno')))
+        accepted = timestamp(state.get('accepted_at'))
+        definition = timestamp(payload.get('saved_at'))
+        chase = timestamp(state.get('last_chase_at'))
+        base = max([x for x in [definition, chase, request] if pd.notna(x)], default=pd.NaT)
+        if state.get('review_status') == 'waiting_engineering':
+            # Sem data confiável, pedir conferência em vez de manter uma cobrança indefinida.
+            if pd.isna(base) or (pd.notna(response) and response > base):
+                out.at[idx, 'Fila'] = 'Conferir retorno'
+                out.at[idx, 'Aguardando'] = 'Orçamentos'
+                out.at[idx, 'Pendência / próxima ação'] = 'Conferir retorno frente aos itens solicitados'
+            else:
+                out.at[idx, 'Fila'] = 'Cobrar Engenharia'
+                out.at[idx, 'Aguardando'] = 'Engenharia'
+                out.at[idx, 'Pendência / próxima ação'] = 'Solicitar: ' + '; '.join(map(str, payload.get('items') or []))
+        elif state.get('review_status') == 'accepted':
+            # updated_at pode mudar só ao atribuir elaborador: nunca equivale a novo aceite.
+            newer_request = pd.notna(request) and (pd.isna(accepted) or request > accepted)
+            changed = timestamp(row.get('_Atualização Engenharia'))
+            if newer_request:
+                continue
+            if pd.isna(accepted) or (pd.notna(changed) and changed > accepted):
+                out.at[idx, 'Fila'] = 'Conferir retorno'
+                out.at[idx, 'Aguardando'] = 'Orçamentos'
+                out.at[idx, 'Pendência / próxima ação'] = 'Conferir atualização posterior ao aceite'
+            else:
+                out.at[idx, 'Fila'] = 'Pronto para elaborar'
+                out.at[idx, 'Aguardando'] = 'Orçamentos'
+                out.at[idx, 'Pendência / próxima ação'] = 'Levantamento aceito por ' + str(state.get('accepted_by') or 'Orçamentos')
+    return out
