@@ -190,8 +190,27 @@ div[data-testid="stButton"] > button[kind="primary"] *,div[data-testid="stButton
 /* Checkboxes / expanders */
 div[data-testid="stCheckbox"] label span {{color:var(--text)!important;}}
 div[data-testid="stExpander"] {{background:transparent!important;border:none!important;}}
-div[data-testid="stExpander"] details {{background:var(--surface2)!important;border:1px solid var(--line)!important;border-radius:10px!important;}}
-div[data-testid="stExpander"] summary,div[data-testid="stExpander"] summary * {{color:var(--text)!important;-webkit-text-fill-color:var(--text)!important;}}
+div[data-testid="stExpander"] details {{background:var(--surface)!important;border:1px solid var(--line)!important;border-radius:10px!important;overflow:hidden;}}
+/* Cabeçalho do expander é um botão escuro: texto sempre branco. */
+div[data-testid="stExpander"] summary {{background:#10243a!important;color:#fff!important;-webkit-text-fill-color:#fff!important;}}
+div[data-testid="stExpander"] summary *,
+div[data-testid="stExpander"] summary p,
+div[data-testid="stExpander"] summary span,
+div[data-testid="stExpander"] summary svg {{color:#fff!important;-webkit-text-fill-color:#fff!important;fill:#fff!important;opacity:1!important;}}
+
+/* Link buttons do Streamlit também usam uma árvore diferente de st.button. */
+[data-testid="stLinkButton"] a,
+a[data-testid^="stBaseLinkButton"] {{background:#10243a!important;border:1px solid #31475d!important;color:#fff!important;-webkit-text-fill-color:#fff!important;border-radius:10px!important;font-weight:750!important;}}
+[data-testid="stLinkButton"] a *,
+a[data-testid^="stBaseLinkButton"] *,
+[data-testid="stLinkButton"] a p,
+[data-testid="stLinkButton"] a span {{color:#fff!important;-webkit-text-fill-color:#fff!important;opacity:1!important;}}
+
+/* Reforço específico para a fila: selecionado escuro = texto branco. */
+.st-key-queue_selector button[aria-pressed="true"],
+.st-key-queue_selector button[aria-pressed="true"] *,
+.st-key-queue_selector button[aria-pressed="true"] p,
+.st-key-queue_selector button[aria-pressed="true"] span {{color:#fff!important;-webkit-text-fill-color:#fff!important;opacity:1!important;}}
 
 @media(max-width:1000px) {{
   .main .block-container{{padding-left:1rem;padding-right:1rem;}}
@@ -486,7 +505,17 @@ def apply_review_states(df: pd.DataFrame, states: dict[str, dict[str, Any]]) -> 
 
         if supervisor:
             out.at[idx, "Engenharia"] = supervisor
-        if status == "accepted":
+
+        # Uma decisão interna antiga não pode esconder uma cobrança mais nova do Trello.
+        trello_request_dt = pd.to_datetime(row.get("_Última solicitação"), utc=True, errors="coerce")
+        state_updated_dt = pd.to_datetime(state.get("updated_at"), utc=True, errors="coerce")
+        state_is_older_than_trello_request = bool(
+            pd.notna(trello_request_dt)
+            and pd.notna(state_updated_dt)
+            and state_updated_dt < trello_request_dt
+        )
+
+        if status == "accepted" and not state_is_older_than_trello_request:
             out.at[idx, "Fila"] = "Pronto para elaborar"
             out.at[idx, "Aguardando"] = "Orçamentos"
             out.at[idx, "Pendência / próxima ação"] = "Levantamento conferido e liberado para elaboração"
@@ -668,7 +697,7 @@ def render_detail(row: pd.Series, state: dict[str, Any] | None, actor: str, all_
         st.write("**Último comentário:**", safe_text(row.get("Último comentário")))
         st.write("**Autor/data:**", safe_text(row.get("Autor último comentário")), "•", safe_text(row.get("Último comentário em")))
         if url and url != "—":
-            st.link_button("Abrir card no Trello ↗", url, use_container_width=True)
+            st.link_button("Abrir card no Trello ↗", url, type="primary", use_container_width=True)
 
 
 # =============================================================================
@@ -684,12 +713,12 @@ except Exception as exc:
     st.error(f"Não foi possível carregar o Trello: {exc}")
     st.stop()
 
-# Neste painel, a lista do Trello "PARA ELABORAR ORÇAMENTO" é a fonte operacional
-# para a fila Pronto para elaborar. Um estado interno salvo depois ainda pode
-# devolver a demanda para cobrança, mas um card apenas por estar nessa lista
-# não deve desaparecer do painel.
-trust_ready = True
-result = analyze_snapshot(snapshot, trust_trello_ready_list=True)
+# A etapa do Trello é contexto, mas não decide sozinha a fila operacional.
+# Comentários/atividades mais recentes podem mostrar que ainda falta informação.
+# Ex.: um card em PARA ELABORAR ORÇAMENTO com "no aguardo das informações
+# @gustavo" continua em Cobrar Engenharia.
+trust_ready = False
+result = analyze_snapshot(snapshot, trust_trello_ready_list=False)
 df_all = result.rows.copy()
 states = load_review_states()
 df_all = apply_review_states(df_all, states)
@@ -797,6 +826,7 @@ if module.startswith("🏠"):
             default=current,
             selection_mode="single",
             label_visibility="collapsed",
+            key="queue_selector",
         ) or current
         st.session_state.selected_queue = selected_queue
 
