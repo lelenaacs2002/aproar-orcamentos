@@ -1,6 +1,3 @@
-Substitua **todo o conteúdo do `radar.py`** pelo código abaixo. **O `app.py` permanece como está.**
-
-```python
 from __future__ import annotations
 
 import json
