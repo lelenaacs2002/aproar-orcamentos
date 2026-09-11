@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from radar import ENGENHEIROS, analyze_snapshot
+from radar import ENGENHEIROS, analyze_snapshot, reconcile_review_states, LOCAL_TZ
 from trello_client import TrelloClient, TrelloError
 
 try:
@@ -231,7 +231,7 @@ a[data-testid^="stBaseLinkButton"] *,
 # =============================================================================
 def secret(name: str, default: Any = None) -> Any:
     try:
-        return st.secrets.get(name, default)
+        return st.secrets.get(name, os.getenv(name, default))
     except Exception:
         return os.getenv(name, default)
 
@@ -248,7 +248,9 @@ def trim(value: Any, size: int = 120) -> str:
 
 def load_snapshot(force_nonce: int = 0) -> dict[str, Any]:
     board = secret("TRELLO_BOARD_URL", secret("TRELLO_BOARD", "https://trello.com/b/TX8hGvmI"))
-    return TrelloClient(board=board).snapshot()
+    snapshot = TrelloClient(board=board).snapshot()
+    snapshot["_fetched_at"] = datetime.now(LOCAL_TZ).strftime("%d/%m/%Y %H:%M")
+    return snapshot
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -286,7 +288,7 @@ def split_items(text: str) -> list[str]:
 
 def gaps_to_items(gaps: Any) -> list[str]:
     raw = safe_text(gaps, "")
-    if not raw:
+    if not raw or raw in {"—", "-", "Nenhuma"}:
         return []
     items = [x.strip() for x in raw.replace(" • ", ";").split(";") if x.strip()]
     return list(dict.fromkeys(items))
@@ -336,7 +338,8 @@ def load_review_states() -> dict[str, dict[str, Any]]:
                 cols = [d.name for d in cur.description]
                 return {str(r[0]): dict(zip(cols, r)) for r in cur.fetchall()}
     except Exception:
-        return {}
+        st.error("Não foi possível carregar as decisões salvas. Verifique a conexão e as tabelas do banco antes de continuar.")
+        st.stop()
 
 
 def save_definition(
@@ -351,6 +354,8 @@ def save_definition(
         return False, "Neon não está disponível."
     if not items:
         return False, "Defina pelo menos um item que precisa ser respondido."
+    if supervisor not in ENGENHEIROS:
+        return False, "Selecione o engenheiro responsável antes de salvar."
 
     payload = {
         "items": items,
@@ -433,7 +438,7 @@ def mark_ready(card_id: str, actor: str) -> tuple[bool, str]:
                         (card_id,review_status,pending_owner_type,pending_reason,accepted_at,accepted_by,updated_at)
                     values (%s,'accepted','budget',null,now(),%s,now())
                     on conflict(card_id) do update set
-                        review_status='accepted', pending_owner_type='budget', pending_reason=null,
+                        review_status='accepted', pending_owner_type='budget',
                         accepted_at=now(), accepted_by=excluded.accepted_by, updated_at=now()
                     """,
                     (card_id, actor),
@@ -489,42 +494,7 @@ def assign_budget_owner(card_id: str, actor: str, owner: str) -> tuple[bool, str
 
 
 def apply_review_states(df: pd.DataFrame, states: dict[str, dict[str, Any]]) -> pd.DataFrame:
-    if df.empty or not states:
-        return df
-    out = df.copy()
-    for idx, row in out.iterrows():
-        card_id = str(row.get("Card ID") or "")
-        state = states.get(card_id)
-        if not state:
-            continue
-        payload = parse_payload(state.get("pending_reason"))
-        items = payload.get("items") or []
-        supervisor = str(payload.get("supervisor") or "").strip()
-        status = str(state.get("review_status") or "")
-        owner_type = str(state.get("pending_owner_type") or "")
-
-        if supervisor:
-            out.at[idx, "Engenharia"] = supervisor
-
-        # Uma decisão interna antiga não pode esconder uma cobrança mais nova do Trello.
-        trello_request_dt = pd.to_datetime(row.get("_Última solicitação"), utc=True, errors="coerce")
-        state_updated_dt = pd.to_datetime(state.get("updated_at"), utc=True, errors="coerce")
-        state_is_older_than_trello_request = bool(
-            pd.notna(trello_request_dt)
-            and pd.notna(state_updated_dt)
-            and state_updated_dt < trello_request_dt
-        )
-
-        if status == "accepted" and not state_is_older_than_trello_request:
-            out.at[idx, "Fila"] = "Pronto para elaborar"
-            out.at[idx, "Aguardando"] = "Orçamentos"
-            out.at[idx, "Pendência / próxima ação"] = "Levantamento conferido e liberado para elaboração"
-        elif status == "waiting_engineering" or (owner_type == "engineering" and items):
-            out.at[idx, "Fila"] = "Cobrar Engenharia"
-            out.at[idx, "Aguardando"] = "Engenharia"
-            if items:
-                out.at[idx, "Pendência / próxima ação"] = "Solicitar: " + "; ".join(map(str, items))
-    return out
+    return reconcile_review_states(df, states)
 
 
 def selected_row(df: pd.DataFrame, card_id: str) -> pd.Series | None:
@@ -542,7 +512,7 @@ def render_compact_row(row: pd.Series, state: dict[str, Any] | None) -> None:
     engineer = safe_text(row.get("Engenharia"), "Não identificado")
     due = due_label(row)
     items = card_items(row, state)
-    missing = " · ".join(items[:3]) if items else "Definir o que precisa ser solicitado"
+    missing = (" · ".join(items[:3]) if items else "Definir o que precisa ser solicitado") if queue == "Cobrar Engenharia" else safe_text(row.get("Pendência / próxima ação"))
 
     st.markdown(
         f"""
@@ -571,6 +541,7 @@ def render_detail(row: pd.Series, state: dict[str, Any] | None, actor: str, all_
     items = card_items(row, state)
     supervisor_saved = str(payload.get("supervisor") or safe_text(row.get("Engenharia"), "Não identificado"))
     url = safe_text(row.get("URL"), "")
+    revision = str(row.get("_Atualização Engenharia") or "") + str((state or {}).get("updated_at") or "")
 
     st.markdown(
         f"""
@@ -608,7 +579,7 @@ def render_detail(row: pd.Series, state: dict[str, Any] | None, actor: str, all_
         with c1:
             response_due = st.date_input(
                 "Prazo para resposta",
-                value=date.today() + timedelta(days=2),
+                value=date.fromisoformat(payload["response_due"][:10]) if payload.get("response_due") else None,
                 key=f"due_{card_id}",
             )
         with c2:
@@ -620,10 +591,17 @@ def render_detail(row: pd.Series, state: dict[str, Any] | None, actor: str, all_
             )
 
         st.markdown(
-            '<div class="ap-help">Esses itens ficam salvos no Neon. Depois, a tela do engenheiro poderá mostrar exatamente esta lista para ele responder item por item.</div>',
+            '<div class="ap-help">Sugestões detectadas no texto precisam ser conferidas. Salvar registra as pendências no painel. A cobrança deve ser enviada pelo operador.</div>',
             unsafe_allow_html=True,
         )
 
+        message = f"{supervisor}, para elaborar o orçamento {row.get('Demanda')}, precisamos:\n" + "\n".join(f"• {item}" for item in current_items)
+        if response_due:
+            message += f"\nPrazo de resposta: {response_due:%d/%m/%Y}."
+        message += f"\nRegistre as informações no cartão: {url}"
+        with st.expander("Texto para copiar e cobrar"):
+            st.code(message, language=None)
+        st.caption("Registrar cobrança apenas anota um contato já realizado; não envia mensagens.")
         b1, b2 = st.columns(2)
         with b1:
             if st.button("Salvar pendências", type="primary", use_container_width=True, key=f"save_{card_id}"):
@@ -633,16 +611,9 @@ def render_detail(row: pd.Series, state: dict[str, Any] | None, actor: str, all_
                     st.rerun()
         with b2:
             if st.button("Registrar cobrança", use_container_width=True, key=f"chase_{card_id}"):
-                if not (state and parse_payload(state.get("pending_reason")).get("items")):
-                    ok, msg = save_definition(card_id, current_items, supervisor, actor, note, response_due)
-                    if not ok:
-                        st.error(msg)
-                    else:
-                        details = " | ".join(current_items)
-                        ok, msg = register_chase(card_id, actor, details)
-                else:
-                    details = " | ".join(current_items)
-                    ok, msg = register_chase(card_id, actor, details)
+                ok, msg = save_definition(card_id, current_items, supervisor, actor, note, response_due)
+                if ok:
+                    ok, msg = register_chase(card_id, actor, " | ".join(current_items))
                 (st.success if ok else st.error)(msg)
                 if ok:
                     st.rerun()
@@ -657,12 +628,13 @@ def render_detail(row: pd.Series, state: dict[str, Any] | None, actor: str, all_
             items = gaps_to_items(row.get("Possíveis lacunas"))
         resolved: list[str] = []
         for i, item in enumerate(items):
-            if st.checkbox(item, key=f"review_{card_id}_{i}"):
+            if st.checkbox(item + " — atendido ou não se aplica", key=f"review_{card_id}_{revision}_{i}"):
                 resolved.append(item)
         unresolved = [x for x in items if x not in resolved]
         st.caption(f"{len(resolved)} atendidos • {len(unresolved)} ainda pendentes")
         note = st.text_input("Observação da revisão", key=f"review_note_{card_id}", placeholder="Opcional")
 
+        confirmed = st.checkbox("Conferi o levantamento e todos os itens estão atendidos ou não se aplicam.", key=f"confirm_{card_id}_{revision}")
         b1, b2 = st.columns(2)
         with b1:
             if st.button("Devolver o que falta", use_container_width=True, key=f"return_{card_id}"):
@@ -674,7 +646,7 @@ def render_detail(row: pd.Series, state: dict[str, Any] | None, actor: str, all_
                     if ok:
                         st.rerun()
         with b2:
-            if st.button("Marcar pronto", type="primary", use_container_width=True, key=f"ready_{card_id}"):
+            if st.button("Marcar pronto", type="primary", use_container_width=True, key=f"ready_{card_id}", disabled=not confirmed or bool(unresolved)):
                 ok, msg = mark_ready(card_id, actor)
                 (st.success if ok else st.error)(msg)
                 if ok:
@@ -692,7 +664,17 @@ def render_detail(row: pd.Series, state: dict[str, Any] | None, actor: str, all_
             if ok:
                 st.rerun()
 
-    with st.expander("Contexto do Trello"):
+    st.caption(f"Resposta: {safe_text(row.get('Prazo resposta'))} • Última cobrança: {safe_text(row.get('Última cobrança'))}")
+    st.caption(f"Responsável identificado por: {safe_text(row.get('Fonte responsável'))}")
+    with st.expander("Descrição, anexos e comentários recebidos do Trello"):
+        st.text(safe_text(row.get("_Descrição"), "Sem descrição."))
+        for attachment in row.get("_Anexos", []) or []:
+            if str(attachment.get("url", "")).startswith("https://"):
+                st.link_button(attachment.get("nome") or "Anexo", attachment["url"])
+        for comment in row.get("_Comentários", []) or []:
+            st.caption(f"{comment['autor']} • {comment['data']}")
+            st.text(comment["texto"])
+        st.caption("Exibimos o histórico entregue pelo cliente Trello. O conteúdo dos anexos não é analisado automaticamente.")
         st.write("**Próximo passo detectado:**", safe_text(row.get("Pendência / próxima ação")))
         st.write("**Último comentário:**", safe_text(row.get("Último comentário")))
         st.write("**Autor/data:**", safe_text(row.get("Autor último comentário")), "•", safe_text(row.get("Último comentário em")))
@@ -742,7 +724,7 @@ with st.sidebar:
     st.toggle("🌙 Modo escuro", key="dark_mode")
     db_status = "conectado" if db_available() else "indisponível"
     st.markdown(
-        f'<div class="ap-side-foot">Trello sincronizado<br>Neon {db_status}<br><br>Central de Orçamentos</div>',
+        f'<div class="ap-side-foot">Trello lido em {escape(str(snapshot.get("_fetched_at", "—")))}<br>Neon {db_status}<br><br>Central de Orçamentos</div>',
         unsafe_allow_html=True,
     )
 
@@ -780,7 +762,12 @@ if module.startswith("🏠"):
                 cached_snapshot.clear()
                 st.rerun()
 
+    search_radar = st.text_input("Buscar demanda ou unidade", key="radar_search")
+    st.caption("Atualize para buscar retornos novos. Prazo do orçamento vem do Trello; prazo de resposta é definido na pendência.")
     filtered = radar_df.copy()
+    if search_radar.strip():
+        hay = filtered["Demanda"].astype(str) + " " + filtered["Unidade"].astype(str)
+        filtered = filtered[hay.str.contains(search_radar.strip(), case=False, regex=False)]
     if not filtered.empty:
         if filtro_eng != "Todos":
             filtered = filtered[filtered["Engenharia"] == filtro_eng]
@@ -808,6 +795,12 @@ if module.startswith("🏠"):
         unsafe_allow_html=True,
     )
 
+    with st.expander("Carga por engenheiro e pendências de resposta"):
+        if not filtered.empty:
+            summary = pd.crosstab(filtered["Engenharia"], filtered["Fila"])
+            st.dataframe(summary, use_container_width=True)
+            cols = ["Demanda", "Engenharia", "Fila", "Pendência / próxima ação", "Prazo resposta", "Situação resposta", "Última cobrança", "Responsável elaboração"]
+            st.dataframe(filtered[cols], hide_index=True, use_container_width=True)
     main_col, detail_col = st.columns([1.7, 1], gap="large")
 
     with main_col:
@@ -849,7 +842,7 @@ if module.startswith("🏠"):
     with detail_col:
         st.markdown(
             '<div class="ap-section-head"><div><div class="ap-section-title">Ação da demanda</div>'
-            '<div class="ap-section-sub">Aqui acontece o trabalho — não no card do Trello.</div></div></div>',
+            '<div class="ap-section-sub">Confira as evidências e registre a próxima ação.</div></div></div>',
             unsafe_allow_html=True,
         )
         row = selected_row(qdf if 'qdf' in locals() else filtered, st.session_state.selected_card_id)
