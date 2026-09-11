@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
-from html import escape
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from radar import analyze_snapshot
+from radar import ENGENHEIROS, analyze_snapshot
 from trello_client import TrelloClient, TrelloError
 
 try:
     import psycopg
-except Exception:  # app continua em modo leitura se dependência/banco não estiver disponível
+except Exception:
     psycopg = None
 
 
@@ -29,39 +28,37 @@ st.set_page_config(
 )
 
 if "dark_mode" not in st.session_state:
-    st.session_state["dark_mode"] = False
-if "fila_orcamentos" not in st.session_state:
-    st.session_state["fila_orcamentos"] = "Cobrar Engenharia"
+    st.session_state.dark_mode = False
+if "selected_card_id" not in st.session_state:
+    st.session_state.selected_card_id = ""
+if "modulo" not in st.session_state:
+    st.session_state.modulo = "Radar de levantamentos"
 
-DARK = bool(st.session_state["dark_mode"])
+DARK = bool(st.session_state.dark_mode)
 
-THEME = (
+COLORS = (
     {
-        "bg": "#0d1520",
-        "surface": "#132131",
-        "surface2": "#18293c",
-        "navy": "#0d2238",
-        "navy2": "#183754",
-        "ink": "#f4f7fb",
+        "bg": "#0b1420",
+        "surface": "#111f2f",
+        "surface2": "#172739",
+        "text": "#f4f7fb",
         "muted": "#a9b8c8",
-        "line": "#2a3b4f",
-        "input": "#162536",
+        "line": "#2a3e53",
+        "navy": "#0c253e",
+        "input": "#142638",
         "input_text": "#f4f7fb",
-        "shadow": "rgba(0,0,0,.16)",
     }
     if DARK
     else {
-        "bg": "#f5f7fb",
+        "bg": "#f4f7fb",
         "surface": "#ffffff",
         "surface2": "#f8fafc",
-        "navy": "#122b44",
-        "navy2": "#1a3b5b",
-        "ink": "#142f49",
-        "muted": "#6f8296",
-        "line": "#d9e2ec",
+        "text": "#15314d",
+        "muted": "#6b7f94",
+        "line": "#d9e3ed",
+        "navy": "#102d4a",
         "input": "#ffffff",
-        "input_text": "#18314a",
-        "shadow": "rgba(21,44,68,.06)",
+        "input_text": "#17324d",
     }
 )
 
@@ -69,152 +66,100 @@ st.markdown(
     f"""
 <style>
 :root {{
-  color-scheme: {"dark" if DARK else "light"};
-  --bg:{THEME['bg']};
-  --surface:{THEME['surface']};
-  --surface2:{THEME['surface2']};
-  --navy:{THEME['navy']};
-  --navy2:{THEME['navy2']};
-  --ink:{THEME['ink']};
-  --muted:{THEME['muted']};
-  --line:{THEME['line']};
-  --input:{THEME['input']};
-  --input-text:{THEME['input_text']};
-  --shadow:{THEME['shadow']};
-  --orange:#ef7643;
-  --orange-soft:{'#3a211a' if DARK else '#fff1ea'};
-  --blue:#3977be;
-  --blue-soft:{'#172d48' if DARK else '#eaf1fb'};
-  --green:#259662;
-  --green-soft:{'#173527' if DARK else '#eaf7f0'};
-  --amber:#c47a20;
-  --amber-soft:{'#3a2a16' if DARK else '#fff6e9'};
-  --red:#c75151;
+  color-scheme:{'dark' if DARK else 'light'};
+  --bg:{COLORS['bg']}; --surface:{COLORS['surface']}; --surface2:{COLORS['surface2']};
+  --text:{COLORS['text']}; --muted:{COLORS['muted']}; --line:{COLORS['line']};
+  --navy:{COLORS['navy']}; --input:{COLORS['input']}; --input-text:{COLORS['input_text']};
+  --orange:#f26b36; --orange-soft:{'#382117' if DARK else '#fff1ea'};
+  --blue:#2468b4; --blue-soft:{'#142d4b' if DARK else '#edf4fd'};
+  --green:#168a55; --green-soft:{'#173729' if DARK else '#edf8f2'};
+  --amber:#bb711d; --amber-soft:{'#382a18' if DARK else '#fff7e9'};
+  --red:#c84f4f; --red-soft:{'#3a2020' if DARK else '#fff0f0'};
 }}
 
-html,body,[data-testid="stAppViewContainer"]{{background:var(--bg)!important;color:var(--ink)!important;}}
+html,body,[data-testid="stAppViewContainer"]{{background:var(--bg)!important;color:var(--text)!important;}}
 [data-testid="stHeader"]{{background:transparent!important;}}
 [data-testid="collapsedControl"],[data-testid="stSidebar"]{{display:none!important;}}
 #MainMenu,footer{{visibility:hidden;}}
-.main .block-container{{max-width:1240px;padding-top:.4rem;padding-bottom:3rem;}}
-p,label,h1,h2,h3,h4,h5,h6{{color:var(--ink);}}
+.main .block-container{{max-width:1520px;padding-top:.45rem;padding-bottom:2.5rem;}}
+p,label,h1,h2,h3,h4,h5,h6{{color:var(--text);}}
 
-.ap-topbar{{background:var(--navy);margin:-.45rem -1rem 1.4rem;padding:16px 24px;border-radius:0 0 16px 16px;}}
-.ap-topbar-inner{{display:flex;align-items:center;justify-content:space-between;gap:18px;}}
-.ap-brand{{display:flex;align-items:center;gap:14px;color:#fff;}}
-.ap-logo{{width:40px;height:40px;border-radius:10px;background:var(--orange);display:grid;place-items:center;font-size:25px;font-weight:900;}}
-.ap-brand-main{{font-size:18px;font-weight:900;letter-spacing:.12em;}}
-.ap-brand-divider{{opacity:.35;font-size:25px;}}
-.ap-brand-area{{font-size:14px;letter-spacing:.17em;}}
-.ap-live{{border:1px solid rgba(255,255,255,.26);border-radius:9px;padding:6px 10px;color:#fff;font-size:12px;}}
+.ap-topbar{{background:var(--navy);margin:-.45rem -1rem 1.25rem;padding:15px 24px;border-radius:0 0 16px 16px;}}
+.ap-topbar-inner{{display:flex;align-items:center;justify-content:space-between;gap:20px;}}
+.ap-brand{{display:flex;align-items:center;gap:13px;color:#fff;}}
+.ap-logo{{width:38px;height:38px;border-radius:9px;background:var(--orange);display:grid;place-items:center;font-size:24px;font-weight:900;}}
+.ap-brand-main{{font-size:17px;font-weight:900;letter-spacing:.12em;}}
+.ap-brand-area{{font-size:13px;letter-spacing:.15em;opacity:.95;}}
+.ap-sep{{opacity:.35;font-size:22px;}}
+.ap-status{{color:#e9f3ff;font-size:12px;border:1px solid rgba(255,255,255,.25);border-radius:999px;padding:6px 10px;}}
 
-.ap-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin:8px 0 10px;}}
-.ap-kicker{{color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.14em;font-size:12px;margin-bottom:6px;}}
-.ap-title{{color:var(--ink);font-size:28px;line-height:1.08;font-weight:900;letter-spacing:-.04em;margin:0;}}
+.ap-kicker{{font-size:11px;text-transform:uppercase;letter-spacing:.14em;font-weight:800;color:var(--muted);margin-bottom:5px;}}
+.ap-title{{font-size:30px;font-weight:900;letter-spacing:-.04em;color:var(--text);line-height:1.08;margin:0;}}
 .ap-dot{{color:var(--orange);}}
-.ap-subtitle{{color:var(--muted);font-size:15px;margin-top:8px;max-width:820px;}}
-.ap-small{{color:var(--muted);font-size:12px;}}
-.ap-toolbar{{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 16px;box-shadow:0 8px 22px var(--shadow);margin-bottom:14px;}}
-.ap-tip{{background:var(--surface);border:1px solid var(--line);border-left:4px solid #7ca7df;border-radius:12px;padding:11px 14px;color:var(--muted);font-size:13px;line-height:1.5;margin:0 0 18px;}}
-.ap-legend{{display:flex;gap:12px;align-items:center;justify-content:flex-end;color:var(--muted);font-size:11px;margin-top:8px;}}
-.ap-theme-wrap{{display:flex;align-items:center;justify-content:flex-end;gap:8px;}}
-.ap-theme-icon{{font-size:12px;color:var(--muted);margin-top:18px;}}
+.ap-sub{{font-size:14px;color:var(--muted);margin-top:6px;}}
+.ap-mini{{font-size:11px;color:var(--muted);}}
+.ap-section-title{{font-size:17px;font-weight:900;color:var(--text);margin:4px 0 2px;}}
+.ap-column-head{{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;}}
+.ap-column-title{{font-size:14px;font-weight:900;color:var(--text);}}
+.ap-count{{font-size:11px;color:var(--muted);background:var(--surface2);border:1px solid var(--line);padding:3px 7px;border-radius:999px;}}
+.ap-empty{{padding:22px 12px;text-align:center;color:var(--muted);font-size:13px;}}
+.ap-detail-title{{font-size:19px;font-weight:900;line-height:1.3;color:var(--text);}}
+.ap-detail-meta{{font-size:12px;color:var(--muted);line-height:1.55;margin-top:4px;}}
+.ap-pill{{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:10px;font-weight:800;margin-right:5px;}}
+.ap-pill-orange{{background:var(--orange-soft);color:{'#ff9d78' if DARK else '#c75528'};}}
+.ap-pill-blue{{background:var(--blue-soft);color:{'#91c2ff' if DARK else '#245e9f'};}}
+.ap-pill-green{{background:var(--green-soft);color:{'#7ed8a7' if DARK else '#16794d'};}}
+.ap-pill-amber{{background:var(--amber-soft);color:{'#f0bd76' if DARK else '#9a5f17'};}}
+.ap-pill-red{{background:var(--red-soft);color:{'#ff9898' if DARK else '#b74343'};}}
+.ap-message{{background:var(--surface2);border:1px solid var(--line);border-radius:12px;padding:11px 12px;color:var(--text);font-size:12px;line-height:1.55;white-space:pre-wrap;}}
+.ap-help{{background:var(--blue-soft);border:1px solid var(--line);border-radius:12px;padding:10px 12px;color:var(--muted);font-size:12px;line-height:1.45;}}
+.ap-flow{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0 14px;}}
+.ap-flow-step{{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px 12px;}}
+.ap-flow-step b{{font-size:12px;color:var(--text);}} .ap-flow-step span{{display:block;font-size:10px;color:var(--muted);margin-top:2px;}}
 
-.ap-metrics{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:16px 0 18px;}}
-.ap-metric{{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px 18px;box-shadow:0 8px 22px var(--shadow);}}
-.ap-metric-top{{display:flex;align-items:center;justify-content:space-between;gap:10px;}}
-.ap-metric-title{{font-size:13px;color:var(--muted);font-weight:700;}}
-.ap-metric-num{{font-size:32px;font-weight:900;line-height:1;margin-top:8px;}}
-.ap-metric-sub{{font-size:12px;color:var(--muted);margin-top:4px;}}
-.orange{{color:var(--orange);}} .blue{{color:var(--blue);}} .green{{color:var(--green);}}
+/* containers */
+div[data-testid="stVerticalBlockBorderWrapper"]{{border-color:var(--line)!important;border-radius:14px!important;background:var(--surface)!important;}}
+div[data-testid="stVerticalBlockBorderWrapper"] > div{{background:transparent!important;}}
 
-.ap-section-head{{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:18px 0 10px;}}
-.ap-section-title{{font-size:20px;font-weight:900;color:var(--ink);}}
-.ap-section-count{{font-size:13px;color:var(--muted);}}
-.ap-mini-muted{{font-size:12px;color:var(--muted);}}
-
-.ap-card{{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:16px 18px;margin:12px 0;box-shadow:0 8px 22px var(--shadow);}}
-.ap-card-top{{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;}}
-.ap-badges{{display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin-bottom:7px;}}
-.ap-badge{{display:inline-flex;align-items:center;padding:5px 10px;border-radius:999px;font-size:11px;font-weight:800;}}
-.ap-badge-orange{{background:var(--orange-soft);color:{'#ff9b70' if DARK else '#c95d2f'};}}
-.ap-badge-blue{{background:var(--blue-soft);color:{'#8fc0ff' if DARK else '#24599b'};}}
-.ap-badge-green{{background:var(--green-soft);color:{'#75d5a1' if DARK else '#1d8d58'};}}
-.ap-badge-amber{{background:var(--amber-soft);color:{'#f3b765' if DARK else '#a96616'};}}
-.ap-badge-gray{{background:var(--surface2);color:var(--muted);border:1px solid var(--line);}}
-.ap-ref{{color:var(--muted);font-size:11px;font-weight:700;}}
-.ap-card-title{{color:var(--ink);font-size:20px;font-weight:900;line-height:1.25;}}
-.ap-card-meta{{color:var(--muted);font-size:13px;margin-top:6px;line-height:1.5;}}
-.ap-card-meta b{{color:var(--ink);}}
-.ap-card-right{{min-width:110px;text-align:right;color:var(--amber);font-size:13px;white-space:nowrap;font-weight:700;}}
-.ap-card-grid{{display:grid;grid-template-columns:1.35fr .9fr;gap:14px;margin-top:14px;}}
-.ap-box{{border:1px solid var(--line);border-radius:14px;padding:14px;background:var(--surface2);}}
-.ap-box-title{{font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;}}
-.ap-box-text{{font-size:14px;color:var(--ink);line-height:1.55;}}
-.ap-list{{margin:0;padding-left:18px;}}
-.ap-list li{{margin:3px 0;color:var(--ink);}}
-.ap-context{{margin-top:10px;font-size:12px;color:var(--muted);}}
-.ap-saved{{margin-top:12px;background:var(--surface2);border:1px solid var(--line);border-radius:11px;padding:11px 12px;color:var(--muted);font-size:12px;line-height:1.55;}}
-.ap-saved b{{color:var(--ink);}}
-.ap-empty{{background:var(--surface);border:1px dashed var(--line);border-radius:14px;padding:22px;color:var(--muted);font-size:14px;}}
-.ap-divider{{height:1px;background:var(--line);margin:14px 0 10px;}}
-.ap-form-help{{font-size:12px;color:var(--muted);line-height:1.5;}}
-
-/* SELECTS */
-.stSelectbox div[data-baseweb="select"],
-.stSelectbox div[data-baseweb="select"] > div,
-.stSelectbox div[data-baseweb="select"] > div > div{{background-color:var(--input)!important;color:var(--input-text)!important;border-color:var(--line)!important;}}
-.stSelectbox div[data-baseweb="select"]{{border:1px solid var(--line)!important;border-radius:11px!important;overflow:hidden;}}
-.stSelectbox div[data-baseweb="select"] span,
-.stSelectbox div[data-baseweb="select"] input,
-.stSelectbox div[data-baseweb="select"] p{{color:var(--input-text)!important;-webkit-text-fill-color:var(--input-text)!important;opacity:1!important;}}
-.stSelectbox div[data-baseweb="select"] svg{{fill:var(--input-text)!important;color:var(--input-text)!important;}}
+/* selects / inputs */
+div[data-baseweb="select"] > div{{background:var(--input)!important;color:var(--input-text)!important;border:1px solid var(--line)!important;border-radius:10px!important;}}
+div[data-baseweb="select"] span,div[data-baseweb="select"] p,div[data-baseweb="select"] input{{color:var(--input-text)!important;-webkit-text-fill-color:var(--input-text)!important;opacity:1!important;}}
+div[data-baseweb="select"] svg{{fill:var(--input-text)!important;color:var(--input-text)!important;}}
 ul[role="listbox"]{{background:var(--surface)!important;border:1px solid var(--line)!important;}}
-li[role="option"],li[role="option"] *{{background:var(--surface)!important;color:var(--ink)!important;-webkit-text-fill-color:var(--ink)!important;}}
+li[role="option"],li[role="option"] *{{background:var(--surface)!important;color:var(--text)!important;-webkit-text-fill-color:var(--text)!important;}}
 li[role="option"]:hover,li[role="option"]:hover *{{background:var(--surface2)!important;}}
+.stTextInput input,.stTextArea textarea,[data-testid="stDateInput"] input{{background:var(--input)!important;color:var(--input-text)!important;-webkit-text-fill-color:var(--input-text)!important;border-color:var(--line)!important;}}
+.stTextInput input::placeholder,.stTextArea textarea::placeholder{{color:var(--muted)!important;}}
 
-/* Inputs */
-.stTextArea textarea,.stTextInput input{{background:var(--input)!important;color:var(--input-text)!important;-webkit-text-fill-color:var(--input-text)!important;border:1px solid var(--line)!important;}}
-.stTextArea textarea::placeholder,.stTextInput input::placeholder{{color:var(--muted)!important;opacity:.8!important;}}
-
-/* BOTÕES */
-div[data-testid="stButton"] > button{{background:var(--surface)!important;color:var(--ink)!important;border:1px solid var(--line)!important;border-radius:12px!important;box-shadow:none!important;font-weight:750!important;opacity:1!important;}}
-div[data-testid="stButton"] > button *,div[data-testid="stButton"] > button p,div[data-testid="stButton"] > button span{{color:var(--ink)!important;-webkit-text-fill-color:var(--ink)!important;opacity:1!important;}}
-div[data-testid="stButton"] > button:hover{{background:var(--surface2)!important;border-color:#9fb3c8!important;}}
-div[data-testid="stButton"] > button[kind="primary"]{{background:var(--navy)!important;border-color:var(--navy)!important;color:#fff!important;}}
+/* buttons */
+div[data-testid="stButton"] > button{{background:var(--surface)!important;color:var(--text)!important;border:1px solid var(--line)!important;border-radius:10px!important;font-weight:750!important;box-shadow:none!important;}}
+div[data-testid="stButton"] > button *,div[data-testid="stButton"] > button p,div[data-testid="stButton"] > button span{{color:var(--text)!important;-webkit-text-fill-color:var(--text)!important;opacity:1!important;}}
+div[data-testid="stButton"] > button:hover{{background:var(--surface2)!important;border-color:#9eb1c4!important;}}
+div[data-testid="stButton"] > button[kind="primary"]{{background:var(--navy)!important;color:#fff!important;border-color:var(--navy)!important;}}
 div[data-testid="stButton"] > button[kind="primary"] *,div[data-testid="stButton"] > button[kind="primary"] p{{color:#fff!important;-webkit-text-fill-color:#fff!important;}}
 
-/* RADIO FILAS */
-div[data-testid="stRadio"] > div[role="radiogroup"]{{display:grid!important;grid-template-columns:repeat(4,1fr);gap:10px;}}
-div[data-testid="stRadio"] label{{background:var(--surface)!important;border:1px solid var(--line)!important;border-radius:12px!important;min-height:48px!important;padding:0 12px!important;display:flex!important;align-items:center!important;justify-content:center!important;}}
-div[data-testid="stRadio"] label p,div[data-testid="stRadio"] label span{{color:var(--ink)!important;-webkit-text-fill-color:var(--ink)!important;opacity:1!important;font-size:13px!important;font-weight:750!important;text-align:center!important;}}
-div[data-testid="stRadio"] label:has(input:checked){{background:var(--navy)!important;border-color:var(--navy)!important;}}
-div[data-testid="stRadio"] label:has(input:checked) p,div[data-testid="stRadio"] label:has(input:checked) span{{color:#fff!important;-webkit-text-fill-color:#fff!important;}}
-div[data-testid="stRadio"] input,div[data-testid="stRadio"] [data-baseweb="radio"] > div:first-child{{display:none!important;}}
+/* metrics */
+div[data-testid="stMetric"]{{background:var(--surface)!important;border:1px solid var(--line)!important;border-radius:14px!important;padding:12px 14px!important;box-shadow:none!important;}}
+div[data-testid="stMetricLabel"] *{{color:var(--muted)!important;}}
+div[data-testid="stMetricValue"] *{{color:var(--text)!important;font-weight:900!important;}}
 
-/* TOGGLE */
-div[data-testid="stToggle"]{{transform:scale(.75);transform-origin:right top;margin-top:4px;}}
+/* checkboxes */
+div[data-testid="stCheckbox"] label span{{color:var(--text)!important;}}
+
+/* toggle */
+div[data-testid="stToggle"]{{transform:scale(.78);transform-origin:right top;}}
 div[data-testid="stToggle"] label,div[data-testid="stToggle"] label *{{color:var(--muted)!important;-webkit-text-fill-color:var(--muted)!important;font-size:11px!important;}}
 
-/* Expander */
-div[data-testid="stExpander"]{{background:transparent!important;border:none!important;box-shadow:none!important;}}
-div[data-testid="stExpander"] details{{border:1px solid var(--line)!important;border-radius:14px!important;background:var(--surface2)!important;}}
-div[data-testid="stExpander"] summary,div[data-testid="stExpander"] summary *{{color:var(--ink)!important;-webkit-text-fill-color:var(--ink)!important;font-weight:700!important;}}
+/* tabs */
+.stTabs [data-baseweb="tab-list"]{{gap:8px;background:transparent;}}
+.stTabs [data-baseweb="tab"]{{background:var(--surface)!important;border:1px solid var(--line)!important;border-radius:10px!important;padding:8px 14px!important;}}
+.stTabs [aria-selected="true"]{{background:var(--navy)!important;}}
+.stTabs [aria-selected="true"] *{{color:#fff!important;}}
 
-/* Forms */
-[data-testid="stForm"]{{background:var(--surface2)!important;border:1px solid var(--line)!important;border-radius:14px!important;padding:14px!important;}}
-
-@media(max-width:900px){{
+@media(max-width:1050px){{
   .main .block-container{{padding-left:.8rem;padding-right:.8rem;}}
   .ap-topbar{{margin-left:-.8rem;margin-right:-.8rem;}}
-  .ap-title{{font-size:31px;}}
-  .ap-head{{display:block;}}
-  .ap-brand-divider,.ap-live{{display:none;}}
-  .ap-card-top{{display:block;}}
-  .ap-card-right{{text-align:left;margin-top:8px;min-width:0;}}
-  .ap-card-grid{{grid-template-columns:1fr;}}
-  .ap-metrics{{grid-template-columns:1fr;}}
-  div[data-testid="stRadio"] > div[role="radiogroup"]{{grid-template-columns:1fr 1fr;}}
+  .ap-flow{{grid-template-columns:1fr;}}
 }}
 </style>
 """,
@@ -223,7 +168,7 @@ div[data-testid="stExpander"] summary,div[data-testid="stExpander"] summary *{{c
 
 
 # =============================================================================
-# HELPERS
+# UTILITÁRIOS
 # =============================================================================
 def secret(name: str, default: Any = None) -> Any:
     try:
@@ -235,6 +180,11 @@ def secret(name: str, default: Any = None) -> Any:
 def safe_text(value: Any, fallback: str = "—") -> str:
     text = str(value or "").strip()
     return text if text and text.lower() != "nan" else fallback
+
+
+def trim(text: Any, size: int = 82) -> str:
+    value = safe_text(text, "")
+    return value if len(value) <= size else value[: size - 1].rstrip() + "…"
 
 
 def load_snapshot(force_nonce: int = 0) -> dict[str, Any]:
@@ -255,51 +205,24 @@ def db_available() -> bool:
     return bool(psycopg is not None and db_url())
 
 
-def _db_error_message(exc: Exception) -> str:
-    text = str(exc or "")
-    if "postgresql://" in text:
-        text = "falha na conexão com o banco"
-    return text[:220]
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def load_review_states() -> dict[str, dict[str, Any]]:
-    if not db_available():
-        return {}
-    try:
-        with psycopg.connect(db_url(), connect_timeout=8) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    select card_id, review_status, pending_owner_type, pending_reason,
-                           last_chase_at, accepted_at, accepted_by, budget_owner, updated_at
-                    from orcamento_review_state
-                    """
-                )
-                cols = [d.name for d in cur.description]
-                return {str(row[0]): dict(zip(cols, row)) for row in cur.fetchall()}
-    except Exception:
-        return {}
-
-
 def parse_payload(raw: Any) -> dict[str, Any]:
     if not raw:
         return {}
     try:
-        data = json.loads(str(raw))
-        return data if isinstance(data, dict) else {}
+        value = json.loads(str(raw))
+        return value if isinstance(value, dict) else {}
     except Exception:
         text = str(raw).strip()
         return {"items": [text]} if text else {}
 
 
 def split_items(text: str) -> list[str]:
-    lines: list[str] = []
+    result: list[str] = []
     for raw in str(text or "").splitlines():
         item = raw.strip().lstrip("-•✓☐ ").strip()
-        if item and item not in lines:
-            lines.append(item)
-    return lines
+        if item and item not in result:
+            result.append(item)
+    return result
 
 
 def gaps_to_items(gaps: Any) -> list[str]:
@@ -310,77 +233,84 @@ def gaps_to_items(gaps: Any) -> list[str]:
     return list(dict.fromkeys(items))
 
 
-def summarize_items(items: list[str], max_items: int = 3) -> str:
-    if not items:
-        return "Defina os itens que precisam ser respondidos."
-    if len(items) <= max_items:
-        return "; ".join(items)
-    return "; ".join(items[:max_items]) + f" (+{len(items) - max_items})"
+def due_score(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 99999.0
 
 
-def save_pending_definition(
-    card_id: str,
-    items: list[str],
-    owner_type: str,
-    actor: str,
-    supervisor: str,
-    note: str,
-) -> tuple[bool, str]:
+def due_label(row: pd.Series) -> str:
+    value = safe_text(row.get("Situação do prazo"), "Sem prazo")
+    return value
+
+
+def short_name(row: pd.Series) -> str:
+    title = safe_text(row.get("Demanda"), "Demanda")
+    unit = safe_text(row.get("Unidade"), "")
+    if " | " in title:
+        first = title.split(" | ")[0].strip()
+        if len(first) > 50:
+            first = first[:49].rstrip() + "…"
+        return first
+    return trim(title, 54) or unit or "Demanda"
+
+
+def engineer_options(df: pd.DataFrame) -> list[str]:
+    names = [x for x in ENGENHEIROS if x != "Gabriel"] + ["Gabriel"]
+    actual = [x for x in df.get("Engenharia", pd.Series(dtype=str)).dropna().astype(str).unique() if x and x != "Não identificado"]
+    return list(dict.fromkeys(["Não identificado"] + names + sorted(actual)))
+
+
+# =============================================================================
+# NEON — ESTADO OPERACIONAL
+# =============================================================================
+@st.cache_data(ttl=20, show_spinner=False)
+def load_review_states() -> dict[str, dict[str, Any]]:
     if not db_available():
-        return False, "Banco Neon não disponível. Confira DATABASE_URL e requirements.txt."
-    if not items:
-        return False, "Inclua pelo menos uma informação a solicitar."
-
-    payload = {
-        "items": items,
-        "note": note.strip(),
-        "supervisor": supervisor,
-        "saved_by": actor,
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-    }
-    raw = json.dumps(payload, ensure_ascii=False)
-    review_status = "waiting_engineering" if owner_type == "engineering" else "waiting_external"
-
+        return {}
     try:
         with psycopg.connect(db_url(), connect_timeout=8) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    insert into orcamento_review_state
-                        (card_id, review_status, pending_owner_type, pending_reason,
-                         last_chase_at, accepted_at, accepted_by, updated_at)
-                    values (%s, %s, %s, %s,
-                            case when %s = 'engineering' then now() else null end,
-                            null, null, now())
-                    on conflict (card_id) do update set
-                        review_status = excluded.review_status,
-                        pending_owner_type = excluded.pending_owner_type,
-                        pending_reason = excluded.pending_reason,
-                        last_chase_at = case when excluded.pending_owner_type = 'engineering' then now() else orcamento_review_state.last_chase_at end,
-                        accepted_at = null,
-                        accepted_by = null,
-                        updated_at = now()
-                    """,
-                    (card_id, review_status, owner_type, raw, owner_type),
-                )
-                cur.execute(
+                    select card_id, review_status, pending_owner_type, pending_reason,
+                           last_chase_at, last_engineer_response_at, accepted_at,
+                           accepted_by, budget_owner, updated_at
+                    from orcamento_review_state
                     """
-                    insert into orcamento_event_log
-                        (card_id, event_type, actor, owner_type, details, occurred_at)
-                    values (%s, 'pending_definition_saved', %s, %s, %s, now())
-                    """,
-                    (card_id, actor, owner_type, raw),
                 )
-            conn.commit()
-        load_review_states.clear()
-        return True, "Pendências salvas."
-    except Exception as exc:
-        return False, f"Não foi possível salvar: {_db_error_message(exc)}"
+                cols = [d.name for d in cur.description]
+                return {str(r[0]): dict(zip(cols, r)) for r in cur.fetchall()}
+    except Exception:
+        return {}
 
 
-def mark_ready(card_id: str, actor: str) -> tuple[bool, str]:
+def save_definition(
+    card_id: str,
+    items: list[str],
+    supervisor: str,
+    actor: str,
+    note: str,
+    response_due: date | None,
+    message: str,
+    status: str = "waiting_engineering",
+) -> tuple[bool, str]:
     if not db_available():
-        return False, "Banco Neon não disponível."
+        return False, "Neon não está disponível."
+    if not items:
+        return False, "Defina pelo menos um item que precisa ser respondido."
+
+    payload = {
+        "items": items,
+        "supervisor": supervisor,
+        "note": note.strip(),
+        "response_due": response_due.isoformat() if response_due else None,
+        "message": message.strip(),
+        "saved_by": actor,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    raw = json.dumps(payload, ensure_ascii=False)
     try:
         with psycopg.connect(db_url(), connect_timeout=8) as conn:
             with conn.cursor() as cur:
@@ -389,81 +319,156 @@ def mark_ready(card_id: str, actor: str) -> tuple[bool, str]:
                     insert into orcamento_review_state
                         (card_id, review_status, pending_owner_type, pending_reason,
                          accepted_at, accepted_by, updated_at)
-                    values (%s, 'accepted', 'budget', null, now(), %s, now())
+                    values (%s, %s, 'engineering', %s, null, null, now())
                     on conflict (card_id) do update set
-                        review_status = 'accepted',
-                        pending_owner_type = 'budget',
-                        pending_reason = null,
-                        accepted_at = now(),
-                        accepted_by = excluded.accepted_by,
-                        updated_at = now()
+                        review_status=excluded.review_status,
+                        pending_owner_type='engineering',
+                        pending_reason=excluded.pending_reason,
+                        accepted_at=null,
+                        accepted_by=null,
+                        updated_at=now()
                     """,
-                    (card_id, actor),
+                    (card_id, status, raw),
                 )
                 cur.execute(
                     """
-                    insert into orcamento_event_log
-                        (card_id, event_type, actor, owner_type, details, occurred_at)
-                    values (%s, 'survey_accepted', %s, 'budget', 'Levantamento liberado para elaboração', now())
+                    insert into orcamento_event_log(card_id,event_type,actor,owner_type,details,occurred_at)
+                    values (%s,'definition_saved',%s,'engineering',%s,now())
                     """,
-                    (card_id, actor),
+                    (card_id, actor, raw),
                 )
             conn.commit()
         load_review_states.clear()
-        return True, "Levantamento marcado como pronto para elaborar."
+        return True, "Definição salva."
     except Exception as exc:
-        return False, f"Não foi possível liberar: {_db_error_message(exc)}"
+        return False, f"Não foi possível salvar: {str(exc)[:180]}"
 
 
-def reopen_review(card_id: str, actor: str) -> tuple[bool, str]:
+def register_chase(card_id: str, actor: str, message: str) -> tuple[bool, str]:
     if not db_available():
-        return False, "Banco Neon não disponível."
+        return False, "Neon não está disponível."
+    try:
+        with psycopg.connect(db_url(), connect_timeout=8) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    update orcamento_review_state
+                    set last_chase_at=now(), review_status='waiting_engineering',
+                        pending_owner_type='engineering', updated_at=now()
+                    where card_id=%s
+                    """,
+                    (card_id,),
+                )
+                cur.execute(
+                    """
+                    insert into orcamento_event_log(card_id,event_type,actor,owner_type,details,occurred_at)
+                    values (%s,'chase_registered',%s,'engineering',%s,now())
+                    """,
+                    (card_id, actor, message),
+                )
+            conn.commit()
+        load_review_states.clear()
+        return True, "Cobrança registrada."
+    except Exception as exc:
+        return False, f"Não foi possível registrar: {str(exc)[:180]}"
+
+
+def return_unresolved(
+    card_id: str,
+    unresolved: list[str],
+    supervisor: str,
+    actor: str,
+    note: str,
+    message: str,
+) -> tuple[bool, str]:
+    return save_definition(
+        card_id=card_id,
+        items=unresolved,
+        supervisor=supervisor,
+        actor=actor,
+        note=note,
+        response_due=None,
+        message=message,
+        status="waiting_engineering",
+    )
+
+
+def mark_ready(card_id: str, actor: str) -> tuple[bool, str]:
+    if not db_available():
+        return False, "Neon não está disponível."
     try:
         with psycopg.connect(db_url(), connect_timeout=8) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     insert into orcamento_review_state
-                        (card_id, review_status, pending_owner_type, updated_at)
-                    values (%s, 'pending', 'engineering', now())
-                    on conflict (card_id) do update set
-                        review_status = 'pending',
-                        pending_owner_type = 'engineering',
-                        pending_reason = null,
-                        accepted_at = null,
-                        accepted_by = null,
-                        updated_at = now()
+                        (card_id,review_status,pending_owner_type,pending_reason,accepted_at,accepted_by,updated_at)
+                    values (%s,'accepted','budget',null,now(),%s,now())
+                    on conflict(card_id) do update set
+                        review_status='accepted', pending_owner_type='budget', pending_reason=null,
+                        accepted_at=now(), accepted_by=excluded.accepted_by, updated_at=now()
                     """,
-                    (card_id,),
+                    (card_id, actor),
                 )
                 cur.execute(
                     """
-                    insert into orcamento_event_log
-                        (card_id, event_type, actor, owner_type, details, occurred_at)
-                    values (%s, 'review_reopened', %s, 'engineering', 'Conferência reaberta', now())
+                    insert into orcamento_event_log(card_id,event_type,actor,owner_type,details,occurred_at)
+                    values (%s,'survey_accepted',%s,'budget','Levantamento liberado para elaboração',now())
                     """,
                     (card_id, actor),
                 )
             conn.commit()
         load_review_states.clear()
-        return True, "Conferência reaberta."
+        return True, "Levantamento liberado para elaboração."
     except Exception as exc:
-        return False, f"Não foi possível reabrir: {_db_error_message(exc)}"
+        return False, f"Não foi possível liberar: {str(exc)[:180]}"
 
 
-def apply_review_state(df: pd.DataFrame, states: dict[str, dict[str, Any]]) -> pd.DataFrame:
+def assign_budget_owner(card_id: str, actor: str, owner: str) -> tuple[bool, str]:
+    if not db_available():
+        return False, "Neon não está disponível."
+    try:
+        with psycopg.connect(db_url(), connect_timeout=8) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    update orcamento_review_state
+                    set budget_owner=%s, updated_at=now()
+                    where card_id=%s
+                    """,
+                    (owner, card_id),
+                )
+                cur.execute(
+                    """
+                    insert into orcamento_event_log(card_id,event_type,actor,owner_type,details,occurred_at)
+                    values (%s,'budget_owner_assigned',%s,'budget',%s,now())
+                    """,
+                    (card_id, actor, owner),
+                )
+            conn.commit()
+        load_review_states.clear()
+        return True, f"Responsável pela elaboração: {owner}."
+    except Exception as exc:
+        return False, f"Não foi possível atribuir: {str(exc)[:180]}"
+
+
+def apply_review_states(df: pd.DataFrame, states: dict[str, dict[str, Any]]) -> pd.DataFrame:
     if df.empty or not states:
         return df
     out = df.copy()
     for idx, row in out.iterrows():
-        cid = str(row.get("Card ID") or "")
-        state = states.get(cid)
+        card_id = str(row.get("Card ID") or "")
+        state = states.get(card_id)
         if not state:
             continue
-        status = str(state.get("review_status") or "")
-        owner = str(state.get("pending_owner_type") or "")
         payload = parse_payload(state.get("pending_reason"))
+        saved_supervisor = str(payload.get("supervisor") or "").strip()
         items = payload.get("items") or []
+        status = str(state.get("review_status") or "")
+        owner_type = str(state.get("pending_owner_type") or "")
+
+        if saved_supervisor:
+            out.at[idx, "Engenharia"] = saved_supervisor
         if items:
             out.at[idx, "Pendências definidas"] = "; ".join(map(str, items))
         out.at[idx, "Status interno"] = status
@@ -471,383 +476,461 @@ def apply_review_state(df: pd.DataFrame, states: dict[str, dict[str, Any]]) -> p
         if status == "accepted":
             out.at[idx, "Fila"] = "Pronto para elaborar"
             out.at[idx, "Aguardando"] = "Orçamentos"
-            out.at[idx, "Pendência / próxima ação"] = "Levantamento conferido e liberado para elaboração"
-        elif status == "waiting_engineering" or (status == "pending" and owner == "engineering" and items):
+            out.at[idx, "Pendência / próxima ação"] = "Definir responsável e iniciar elaboração"
+        elif status == "waiting_engineering" or (status == "pending" and owner_type == "engineering" and items):
             out.at[idx, "Fila"] = "Cobrar Engenharia"
             out.at[idx, "Aguardando"] = "Engenharia"
             if items:
-                out.at[idx, "Pendência / próxima ação"] = "Solicitar ao supervisor: " + "; ".join(map(str, items))
-        elif status == "waiting_external" or owner in {"client", "supplier", "specialist"}:
-            out.at[idx, "Fila"] = "Aguardar terceiros"
-            out.at[idx, "Aguardando"] = {"client": "Cliente", "supplier": "Fornecedor", "specialist": "Especialista"}.get(owner, "Terceiros")
-            if items:
-                out.at[idx, "Pendência / próxima ação"] = "Aguardar: " + "; ".join(map(str, items))
+                out.at[idx, "Pendência / próxima ação"] = "Cobrar: " + "; ".join(map(str, items))
     return out
 
 
-def render_topbar() -> None:
+# =============================================================================
+# UI HELPERS
+# =============================================================================
+def topbar() -> None:
     st.markdown(
         """
         <div class="ap-topbar"><div class="ap-topbar-inner">
           <div class="ap-brand">
-            <div class="ap-logo">A</div><div class="ap-brand-main">APROAR</div>
-            <div class="ap-brand-divider">|</div><div class="ap-brand-area">ORÇAMENTOS</div>
+            <div class="ap-logo">A</div>
+            <div class="ap-brand-main">APROAR</div><div class="ap-sep">|</div>
+            <div class="ap-brand-area">ORÇAMENTOS</div>
           </div>
-          <div class="ap-live">Central de levantamentos</div>
+          <div class="ap-status">Central de levantamentos</div>
         </div></div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_metrics(conferir: int, cobrar: int, elaborar: int) -> None:
-    st.markdown(
-        f"""
-        <div class="ap-metrics">
-          <div class="ap-metric">
-            <div class="ap-metric-top"><div class="ap-metric-title">Para conferir</div><div class="ap-mini-muted">retornos recebidos</div></div>
-            <div class="ap-metric-num orange">{conferir:02d}</div>
-            <div class="ap-metric-sub">Orçamentos precisa validar</div>
-          </div>
-          <div class="ap-metric">
-            <div class="ap-metric-top"><div class="ap-metric-title">Cobrar Engenharia</div><div class="ap-mini-muted">pendências abertas</div></div>
-            <div class="ap-metric-num blue">{cobrar:02d}</div>
-            <div class="ap-metric-sub">itens a cobrar dos supervisores</div>
-          </div>
-          <div class="ap-metric">
-            <div class="ap-metric-top"><div class="ap-metric-title">Pronto para elaborar</div><div class="ap-mini-muted">liberados</div></div>
-            <div class="ap-metric-num green">{elaborar:02d}</div>
-            <div class="ap-metric-sub">já podem seguir para orçamento</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def queue_pill(queue: str) -> str:
+    css = {
+        "Cobrar Engenharia": "ap-pill-orange",
+        "Conferir retorno": "ap-pill-blue",
+        "Pronto para elaborar": "ap-pill-green",
+    }.get(queue, "ap-pill-amber")
+    return f'<span class="ap-pill {css}">{queue}</span>'
+
+
+def card_items(row: pd.Series, state: dict[str, Any] | None) -> list[str]:
+    payload = parse_payload((state or {}).get("pending_reason"))
+    saved = [str(x) for x in (payload.get("items") or []) if str(x).strip()]
+    return saved or gaps_to_items(row.get("Possíveis lacunas"))
+
+
+def build_message(row: pd.Series, items: list[str], supervisor: str, response_due: date | None) -> str:
+    name = supervisor if supervisor and supervisor != "Não identificado" else ""
+    greeting = f"Olá, {name}." if name else "Olá."
+    title = short_name(row)
+    unit = safe_text(row.get("Unidade"), "")
+    bullets = "\n".join(f"• {item}" for item in items) if items else "• Informações do levantamento"
+    due_text = f"\nSe possível, responder até {response_due.strftime('%d/%m/%Y')}." if response_due else ""
+    return (
+        f"{greeting}\n\n"
+        f"Para avançarmos com o orçamento de “{title}”"
+        + (f" — {unit}" if unit and unit != "—" else "")
+        + ", precisamos confirmar:\n\n"
+        + bullets
+        + due_text
+        + "\n\nPor favor, responda especificamente esses pontos para conseguirmos liberar o levantamento."
     )
 
 
-def fila_badge(fila: str) -> str:
-    return {
-        "Cobrar Engenharia": "ap-badge-orange",
-        "Conferir retorno": "ap-badge-blue",
-        "Pronto para elaborar": "ap-badge-green",
-        "Aguardar terceiros": "ap-badge-amber",
-    }.get(fila, "ap-badge-gray")
+def render_board_card(row: pd.Series, state: dict[str, Any] | None, queue: str) -> None:
+    card_id = str(row.get("Card ID") or "")
+    items = card_items(row, state)
+    supervisor = safe_text(row.get("Engenharia"), "Não identificado")
+    unit = safe_text(row.get("Unidade"), "Não mapeada")
+    due = due_label(row)
+
+    with st.container(border=True):
+        st.markdown(queue_pill(queue), unsafe_allow_html=True)
+        st.markdown(f"**{short_name(row)}**")
+        st.caption(f"{unit} • {supervisor} • {due}")
+
+        if queue == "Cobrar Engenharia":
+            st.caption("Falta: " + (" · ".join(items[:3]) if items else "definir a cobrança"))
+        elif queue == "Conferir retorno":
+            last = safe_text(row.get("Último retorno Engenharia"), "Retorno recebido; conferir conteúdo.")
+            st.caption("Retorno: " + trim(last, 115))
+        else:
+            owner = safe_text((state or {}).get("budget_owner"), "Sem responsável")
+            st.caption(f"Levantamento liberado • elaboração: {owner}")
+
+        if st.button("Abrir demanda", key=f"open_{queue}_{card_id}", use_container_width=True):
+            st.session_state.selected_card_id = card_id
+            st.rerun()
 
 
-def render_card_summary(row: pd.Series, state: dict[str, Any] | None) -> None:
-    fila = safe_text(row.get("Fila"))
-    title = safe_text(row.get("Demanda"))
-    unidade = safe_text(row.get("Unidade"))
-    supervisor = safe_text(row.get("Engenharia"))
-    etapa = safe_text(row.get("Etapa Trello"))
-    prazo = safe_text(row.get("Situação do prazo"))
-    next_action = safe_text(row.get("Pendência / próxima ação"))
-    gaps_items = gaps_to_items(row.get("Possíveis lacunas"))
-    last_reply = safe_text(row.get("Último retorno Engenharia"))
-    waiting = safe_text(row.get("Aguardando"))
-    service = safe_text(row.get("Tipo de serviço"))
+def selected_row(df: pd.DataFrame, card_id: str) -> pd.Series | None:
+    if df.empty or not card_id:
+        return None
+    rows = df[df["Card ID"].astype(str) == str(card_id)]
+    if rows.empty:
+        return None
+    return rows.iloc[0]
+
+
+def render_detail(row: pd.Series, state: dict[str, Any] | None, actor: str, all_df: pd.DataFrame) -> None:
+    card_id = str(row.get("Card ID") or "")
+    queue = safe_text(row.get("Fila"))
+    payload = parse_payload((state or {}).get("pending_reason"))
+    items = card_items(row, state)
+    saved_supervisor = str(payload.get("supervisor") or safe_text(row.get("Engenharia"), "Não identificado"))
     url = safe_text(row.get("URL"), "")
-    ref = safe_text(row.get("Card ID"), "")[-4:] or "—"
 
-    payload = parse_payload((state or {}).get("pending_reason")) if state else {}
-    saved_items = payload.get("items") or []
-    note = safe_text(payload.get("note"), "")
-    display_items = saved_items or gaps_items
-    source_label = "Definido por Orçamentos" if saved_items else "Sugestão do sistema"
-
-    list_html = "".join(f"<li>{escape(str(item))}</li>" for item in display_items[:5]) or "<li>Defina os itens que faltam.</li>"
-    more_html = f'<div class="ap-context">+{len(display_items)-5} itens</div>' if len(display_items) > 5 else ""
-    note_html = f'<div class="ap-saved"><b>Observação interna:</b> {escape(note)}</div>' if note else ""
-    reply_html = "" if last_reply == "—" else f'<div class="ap-context"><b>Último retorno:</b> {escape(last_reply)}</div>'
-    link_html = f'<a href="{escape(url, quote=True)}" target="_blank">Abrir no Trello ↗</a>' if url else ""
-
+    st.markdown(queue_pill(queue), unsafe_allow_html=True)
+    st.markdown(f'<div class="ap-detail-title">{escape(safe_text(row.get("Demanda")))}</div>', unsafe_allow_html=True)
     st.markdown(
-        f"""
-        <div class="ap-card">
-          <div class="ap-card-top">
-            <div style="flex:1;min-width:0;">
-              <div class="ap-badges">
-                <span class="ap-badge {fila_badge(fila)}">{escape(fila)}</span>
-                <span class="ap-ref">REF. {escape(ref)}</span>
-              </div>
-              <div class="ap-card-title">{escape(title)}</div>
-              <div class="ap-card-meta"><b>Unidade:</b> {escape(unidade)} &nbsp;•&nbsp; <b>Supervisor:</b> {escape(supervisor)} &nbsp;•&nbsp; <b>Etapa:</b> {escape(etapa)}</div>
-            </div>
-            <div class="ap-card-right">{escape(prazo)}</div>
-          </div>
-
-          <div class="ap-card-grid">
-            <div class="ap-box">
-              <div class="ap-box-title">O que cobrar / conferir</div>
-              <div class="ap-box-text">
-                <ul class="ap-list">{list_html}</ul>
-                {more_html}
-              </div>
-              <div class="ap-context"><b>Origem:</b> {escape(source_label)}</div>
-              {reply_html}
-            </div>
-            <div class="ap-box">
-              <div class="ap-box-title">Próxima ação</div>
-              <div class="ap-box-text">{escape(next_action)}</div>
-              <div class="ap-context"><b>Aguardando:</b> {escape(waiting)}</div>
-              <div class="ap-context"><b>Serviço:</b> {escape(service)}</div>
-              <div class="ap-context">{link_html}</div>
-            </div>
-          </div>
-          {note_html}
-        </div>
-        """,
+        f'<div class="ap-detail-meta"><b>Unidade:</b> {escape(safe_text(row.get("Unidade")))} &nbsp;•&nbsp; '
+        f'<b>Supervisor:</b> {escape(safe_text(row.get("Engenharia")))} &nbsp;•&nbsp; '
+        f'<b>Etapa Trello:</b> {escape(safe_text(row.get("Etapa Trello")))}<br>'
+        f'<b>Prazo:</b> {escape(due_label(row))}</div>',
         unsafe_allow_html=True,
     )
+
+    if url and url != "—":
+        st.link_button("Abrir no Trello ↗", url, use_container_width=True)
+
+    st.divider()
+
+    if queue == "Cobrar Engenharia":
+        st.markdown("#### Definir a cobrança")
+        st.caption("Essa lista será a definição oficial do que o supervisor precisa responder.")
+
+        initial = "\n".join(f"- {x}" for x in items)
+        pending_text = st.text_area(
+            "Itens que precisam ser respondidos",
+            value=initial,
+            height=150,
+            key=f"items_{card_id}",
+            placeholder="- Altura da pintura\n- Acabamento da tinta\n- Área total em m²",
+        )
+        current_items = split_items(pending_text)
+
+        engs = engineer_options(all_df)
+        current_idx = engs.index(saved_supervisor) if saved_supervisor in engs else 0
+        supervisor = st.selectbox("Quem responde?", engs, index=current_idx, key=f"sup_{card_id}")
+        response_due = st.date_input(
+            "Prazo para resposta",
+            value=date.today() + timedelta(days=2),
+            key=f"resp_due_{card_id}",
+        )
+        note = st.text_input(
+            "Observação interna (opcional)",
+            value=str(payload.get("note") or ""),
+            key=f"note_{card_id}",
+        )
+
+        suggested_message = build_message(row, current_items, supervisor, response_due)
+        stored_message = str(payload.get("message") or "").strip()
+        message = st.text_area(
+            "Mensagem para o supervisor",
+            value=stored_message or suggested_message,
+            height=190,
+            key=f"msg_{card_id}",
+        )
+        st.markdown(
+            '<div class="ap-help"><b>Como funcionará:</b> hoje o botão registra a cobrança e salva exatamente os itens. '
+            'Quando o portal dos engenheiros for criado, esses mesmos itens aparecerão para ele responder um por um.</div>',
+            unsafe_allow_html=True,
+        )
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Salvar definição", type="primary", use_container_width=True, key=f"save_{card_id}"):
+                ok, msg = save_definition(card_id, current_items, supervisor, actor, note, response_due, message)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+        with b2:
+            if st.button("Registrar cobrança", use_container_width=True, key=f"chase_{card_id}"):
+                if not state or not parse_payload(state.get("pending_reason")).get("items"):
+                    ok, msg = save_definition(card_id, current_items, supervisor, actor, note, response_due, message)
+                    if not ok:
+                        st.error(msg)
+                    else:
+                        ok, msg = register_chase(card_id, actor, message)
+                else:
+                    ok, msg = register_chase(card_id, actor, message)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+
+        last_chase = (state or {}).get("last_chase_at")
+        if last_chase:
+            st.caption(f"Última cobrança registrada: {last_chase}")
+
+    elif queue == "Conferir retorno":
+        st.markdown("#### Revisar retorno")
+        st.caption("Compare o que foi pedido com o que o supervisor respondeu.")
+
+        last_reply = safe_text(row.get("Último retorno Engenharia"), "Nenhum texto de retorno foi identificado.")
+        st.markdown("**Último retorno da Engenharia**")
+        st.markdown(f'<div class="ap-message">{last_reply}</div>', unsafe_allow_html=True)
+
+        st.markdown("**Itens que precisam ser validados**")
+        if not items:
+            st.info("Ainda não existe uma lista estruturada salva para esta demanda. Você pode definir uma abaixo.")
+            items = gaps_to_items(row.get("Possíveis lacunas"))
+
+        resolved: list[str] = []
+        for i, item in enumerate(items):
+            if st.checkbox(f"Atendido — {item}", key=f"review_{card_id}_{i}"):
+                resolved.append(item)
+        unresolved = [x for x in items if x not in resolved]
+
+        note = st.text_input("Observação da revisão (opcional)", key=f"review_note_{card_id}")
+        st.caption(f"Atendidos: {len(resolved)} • ainda faltam: {len(unresolved)}")
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Devolver o que falta", use_container_width=True, key=f"return_{card_id}"):
+                if not unresolved:
+                    st.warning("Todos os itens foram marcados como atendidos. Use “Marcar pronto”.")
+                else:
+                    message = build_message(row, unresolved, saved_supervisor, None)
+                    ok, msg = return_unresolved(card_id, unresolved, saved_supervisor, actor, note, message)
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
+        with b2:
+            if st.button("Marcar pronto", type="primary", use_container_width=True, key=f"ready_{card_id}"):
+                ok, msg = mark_ready(card_id, actor)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+
+    elif queue == "Pronto para elaborar":
+        st.markdown("#### Pronto para elaborar")
+        accepted_by = safe_text((state or {}).get("accepted_by"), "Orçamentos")
+        accepted_at = safe_text((state or {}).get("accepted_at"), "")
+        st.success(f"Levantamento conferido por {accepted_by}.")
+        if accepted_at:
+            st.caption(f"Liberação registrada em {accepted_at}")
+
+        owners = ["Laisa", "Simeone", "César"]
+        current_owner = safe_text((state or {}).get("budget_owner"), "")
+        idx = owners.index(current_owner) if current_owner in owners else 0
+        budget_owner = st.selectbox("Responsável pela elaboração", owners, index=idx, key=f"budget_{card_id}")
+        if st.button("Atribuir elaboração", type="primary", use_container_width=True, key=f"assign_{card_id}"):
+            ok, msg = assign_budget_owner(card_id, actor, budget_owner)
+            (st.success if ok else st.error)(msg)
+            if ok:
+                st.rerun()
+
+    else:
+        st.info("Esta demanda está fora das três filas prioritárias do Radar.")
+
+    with st.expander("Ver contexto do Trello"):
+        st.write("**Próximo passo detectado:**", safe_text(row.get("Pendência / próxima ação")))
+        st.write("**Possíveis lacunas detectadas:**", safe_text(row.get("Possíveis lacunas")))
+        st.write("**Último comentário:**", safe_text(row.get("Último comentário")))
+        st.write("**Autor / data:**", safe_text(row.get("Autor último comentário")), "•", safe_text(row.get("Último comentário em")))
 
 
 # =============================================================================
-# CARREGAMENTO
+# DADOS
 # =============================================================================
 nonce = int(st.session_state.get("trello_nonce", 0))
 try:
     snapshot = cached_snapshot(nonce)
 except TrelloError as exc:
-    render_topbar(); st.error(str(exc)); st.stop()
+    topbar(); st.error(str(exc)); st.stop()
 except Exception as exc:
-    render_topbar(); st.error(f"Não foi possível carregar o Trello: {exc}"); st.stop()
+    topbar(); st.error(f"Não foi possível carregar o Trello: {exc}"); st.stop()
 
 trust_ready = bool(secret("TRUST_TRELLO_READY_LIST", False))
 result = analyze_snapshot(snapshot, trust_trello_ready_list=trust_ready)
-df = result.rows.copy()
+df_all = result.rows.copy()
 states = load_review_states()
-df = apply_review_state(df, states)
-
-levantamento_stages = {
-    "SOLICITADOS",
-    "SOLICITADOS - PENDÊNCIAS CLIENTE",
-    "SOLICITADOS – PENDÊNCIAS CLIENTE",
-    "PARA ELABORAR ORÇAMENTO",
-}
-if not df.empty:
-    mask = df["Etapa Trello"].astype(str).str.upper().isin({x.upper() for x in levantamento_stages})
-    df = df[mask].copy()
+df_all = apply_review_states(df_all, states)
 
 
 # =============================================================================
-# INTERFACE — SOMENTE SETOR DE ORÇAMENTOS
+# CABEÇALHO / CONTROLES
 # =============================================================================
-render_topbar()
+topbar()
 
-h1, h2 = st.columns([8, 1.5])
-with h1:
-    st.markdown('<div class="ap-kicker">Orçamentos / Conferência de levantamentos</div>', unsafe_allow_html=True)
+head_l, head_r = st.columns([7, 2.2])
+with head_l:
+    st.markdown('<div class="ap-kicker">Orçamentos / Central de levantamentos</div>', unsafe_allow_html=True)
     st.markdown('<h1 class="ap-title">Definir e cobrar levantamentos<span class="ap-dot">.</span></h1>', unsafe_allow_html=True)
-    st.markdown('<div class="ap-subtitle">Menos leitura do card e mais decisão: aqui o setor define exatamente o que falta, de quem cobrar e o que já pode seguir para elaboração.</div>', unsafe_allow_html=True)
-with h2:
-    st.markdown('<div class="ap-theme-wrap"><div class="ap-theme-icon">◐</div></div>', unsafe_allow_html=True)
-    st.toggle("Escuro", key="dark_mode", help="Alternar modo claro/escuro")
+    st.markdown('<div class="ap-sub">Prioridade: o que cobrar dos engenheiros, o que precisa ser revisado e o que já está pronto para elaborar.</div>', unsafe_allow_html=True)
+with head_r:
+    h1, h2 = st.columns([1.8, 1])
+    with h1:
+        actor = st.selectbox("Operador", ["Laisa", "Simeone", "César"], label_visibility="collapsed")
+    with h2:
+        st.toggle("Escuro", key="dark_mode", help="Alternar claro/escuro")
 
-st.markdown('<div class="ap-toolbar">', unsafe_allow_html=True)
-t1, t2, t3 = st.columns([1.1, 1.4, 4])
-with t1:
+ctl1, ctl2, ctl3 = st.columns([1.2, 2, 6])
+with ctl1:
     if st.button("↻ Atualizar", use_container_width=True):
-        st.session_state["trello_nonce"] = int(st.session_state.get("trello_nonce", 0)) + 1
-        cached_snapshot.clear(); st.rerun()
-with t2:
-    actor = st.selectbox("Operando como", ["Laisa", "Simeone", "César"], label_visibility="collapsed")
-with t3:
+        st.session_state.trello_nonce = int(st.session_state.get("trello_nonce", 0)) + 1
+        cached_snapshot.clear()
+        st.rerun()
+with ctl2:
+    modulo = st.selectbox(
+        "Módulo",
+        ["Radar de levantamentos", "Fluxo geral"],
+        index=0 if st.session_state.modulo == "Radar de levantamentos" else 1,
+        label_visibility="collapsed",
+    )
+    st.session_state.modulo = modulo
+with ctl3:
     board_name = safe_text((snapshot.get("board") or {}).get("name"), "ORÇAMENTOS")
     db_status = "Neon conectado" if db_available() else "Neon indisponível"
-    st.markdown(f'<div class="ap-small"><b>Quadro:</b> {escape(board_name)} &nbsp;•&nbsp; <b>Status:</b> {escape(db_status)}</div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
+    st.caption(f"Quadro: {board_name} • {db_status} • atualização manual ou a cada 5 minutos")
 
-st.markdown(
-    """
-    <div class="ap-tip">
-      <b>Como usar:</b> escolha uma fila, abra a demanda, ajuste os itens do checklist e salve.
-      O objetivo desta tela é sair do “parece que falta algo” para uma cobrança objetiva: <b>qual informação falta</b> e <b>quem precisa responder</b>.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
 
-# FILTROS
-f1, f2, f3, f4 = st.columns(4)
-engineer_options = ["Todos"] + sorted([x for x in df.get("Engenharia", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
-stage_options = ["Todas"] + sorted([x for x in df.get("Etapa Trello", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
-wait_options = ["Todos"] + sorted([x for x in df.get("Aguardando", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
-with f1:
-    filtro_eng = st.selectbox("Engenharia", engineer_options)
-with f2:
-    filtro_stage = st.selectbox("Etapa Trello", stage_options)
-with f3:
-    filtro_wait = st.selectbox("Aguardando", wait_options)
-with f4:
-    filtro_prazo = st.selectbox("Prazo", ["Todos", "Atrasados", "Hoje", "Até 2 dias", "Sem prazo"])
+# =============================================================================
+# MÓDULO 1 — RADAR DE LEVANTAMENTOS
+# =============================================================================
+if modulo == "Radar de levantamentos":
+    # Este radar mostra somente as três filas operacionais prioritárias.
+    radar_df = df_all[df_all["Fila"].isin(["Cobrar Engenharia", "Conferir retorno", "Pronto para elaborar"])].copy()
 
-filtered = df.copy()
-if not filtered.empty:
-    if filtro_eng != "Todos":
-        filtered = filtered[filtered["Engenharia"] == filtro_eng]
-    if filtro_stage != "Todas":
-        filtered = filtered[filtered["Etapa Trello"] == filtro_stage]
-    if filtro_wait != "Todos":
-        filtered = filtered[filtered["Aguardando"] == filtro_wait]
-    dias = pd.to_numeric(filtered.get("Dias até prazo", pd.Series(index=filtered.index, dtype=float)), errors="coerce")
-    if filtro_prazo == "Atrasados":
-        filtered = filtered[dias < 0]
-    elif filtro_prazo == "Hoje":
-        filtered = filtered[dias == 0]
-    elif filtro_prazo == "Até 2 dias":
-        filtered = filtered[dias.between(0, 2, inclusive="both")]
-    elif filtro_prazo == "Sem prazo":
-        filtered = filtered[dias.isna()]
+    f1, f2, f3, f4, f5 = st.columns([1.15, 1.2, 1.15, 1.0, 1.5])
+    eng_opts = ["Todos"] + sorted([x for x in radar_df.get("Engenharia", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
+    stage_opts = ["Todas"] + sorted([x for x in radar_df.get("Etapa Trello", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
+    with f1:
+        filtro_eng = st.selectbox("Engenharia", eng_opts)
+    with f2:
+        filtro_stage = st.selectbox("Etapa Trello", stage_opts)
+    with f3:
+        filtro_prazo = st.selectbox("Prazo", ["Todos", "Atrasados", "Hoje", "Até 2 dias", "Sem prazo"])
+    with f4:
+        ordenacao = st.selectbox("Ordenar", ["Prazo", "Mais recentes"])
+    with f5:
+        busca = st.text_input("Buscar", placeholder="Obra, unidade, supervisor…")
 
-counts = filtered["Fila"].value_counts() if not filtered.empty else pd.Series(dtype=int)
-render_metrics(int(counts.get("Conferir retorno", 0)), int(counts.get("Cobrar Engenharia", 0)), int(counts.get("Pronto para elaborar", 0)))
+    filtered = radar_df.copy()
+    if not filtered.empty:
+        if filtro_eng != "Todos":
+            filtered = filtered[filtered["Engenharia"] == filtro_eng]
+        if filtro_stage != "Todas":
+            filtered = filtered[filtered["Etapa Trello"] == filtro_stage]
+        dias = pd.to_numeric(filtered.get("Dias até prazo", pd.Series(index=filtered.index, dtype=float)), errors="coerce")
+        if filtro_prazo == "Atrasados":
+            filtered = filtered[dias < 0]
+        elif filtro_prazo == "Hoje":
+            filtered = filtered[dias == 0]
+        elif filtro_prazo == "Até 2 dias":
+            filtered = filtered[dias.between(0, 2, inclusive="both")]
+        elif filtro_prazo == "Sem prazo":
+            filtered = filtered[dias.isna()]
+        if busca.strip():
+            q = busca.strip().casefold()
+            hay = (
+                filtered["Demanda"].astype(str) + " " +
+                filtered["Unidade"].astype(str) + " " +
+                filtered["Engenharia"].astype(str)
+            ).str.casefold()
+            filtered = filtered[hay.str.contains(q, regex=False)]
 
-st.markdown(f'<div class="ap-section-head"><div class="ap-section-title">Fila de trabalho</div><div class="ap-section-count">{len(filtered)} demandas nos filtros atuais</div></div>', unsafe_allow_html=True)
+        if ordenacao == "Prazo":
+            filtered["_sort"] = pd.to_numeric(filtered.get("Dias até prazo"), errors="coerce").fillna(99999)
+            filtered = filtered.sort_values("_sort", ascending=True)
+        else:
+            filtered = filtered.sort_values("Último comentário em", ascending=False, na_position="last")
 
-queue_order = ["Cobrar Engenharia", "Conferir retorno", "Pronto para elaborar", "Aguardar terceiros"]
-queue_labels = {
-    "Cobrar Engenharia": f"Cobrar Engenharia ({int(counts.get('Cobrar Engenharia', 0))})",
-    "Conferir retorno": f"Conferir retorno ({int(counts.get('Conferir retorno', 0))})",
-    "Pronto para elaborar": f"Pronto para elaborar ({int(counts.get('Pronto para elaborar', 0))})",
-    "Aguardar terceiros": f"Terceiros ({int(counts.get('Aguardar terceiros', 0))})",
-}
-reverse_labels = {v: k for k, v in queue_labels.items()}
-current_queue = st.session_state.get("fila_orcamentos", "Cobrar Engenharia")
-if current_queue not in queue_order:
-    current_queue = "Cobrar Engenharia"
-selected_label = st.radio(
-    "Fila",
-    [queue_labels[q] for q in queue_order],
-    index=queue_order.index(current_queue),
-    horizontal=True,
-    label_visibility="collapsed",
-)
-selected_queue = reverse_labels[selected_label]
-st.session_state["fila_orcamentos"] = selected_queue
+    counts = filtered["Fila"].value_counts() if not filtered.empty else pd.Series(dtype=int)
+    late = int((pd.to_numeric(filtered.get("Dias até prazo", pd.Series(dtype=float)), errors="coerce") < 0).sum()) if not filtered.empty else 0
 
-queue_df = filtered[filtered["Fila"] == selected_queue].copy() if not filtered.empty else pd.DataFrame()
-if queue_df.empty:
-    st.markdown('<div class="ap-empty">Nenhuma demanda nesta fila com os filtros atuais.</div>', unsafe_allow_html=True)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Cobrar Engenharia", int(counts.get("Cobrar Engenharia", 0)))
+    m2.metric("Conferir retorno", int(counts.get("Conferir retorno", 0)))
+    m3.metric("Pronto para elaborar", int(counts.get("Pronto para elaborar", 0)))
+    m4.metric("Atrasadas", late)
+
+    st.markdown(
+        '<div class="ap-flow">'
+        '<div class="ap-flow-step"><b>1 · Cobrar Engenharia</b><span>Definir exatamente o que falta e registrar a cobrança.</span></div>'
+        '<div class="ap-flow-step"><b>2 · Conferir retorno</b><span>Validar item a item o que o supervisor respondeu.</span></div>'
+        '<div class="ap-flow-step"><b>3 · Pronto para elaborar</b><span>Atribuir quem fará o orçamento e seguir para produção.</span></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    board_area, detail_area = st.columns([3.45, 1.45], gap="large")
+
+    queues = ["Cobrar Engenharia", "Conferir retorno", "Pronto para elaborar"]
+    visible_ids = set(filtered["Card ID"].astype(str).tolist()) if not filtered.empty else set()
+    if st.session_state.selected_card_id not in visible_ids:
+        st.session_state.selected_card_id = str(filtered.iloc[0]["Card ID"]) if not filtered.empty else ""
+
+    with board_area:
+        st.markdown('<div class="ap-section-title">Fila de trabalho</div>', unsafe_allow_html=True)
+        st.caption(f"{len(filtered)} demandas nos filtros atuais")
+        c1, c2, c3 = st.columns(3, gap="small")
+        for col, queue in zip([c1, c2, c3], queues):
+            with col:
+                qdf = filtered[filtered["Fila"] == queue].copy() if not filtered.empty else pd.DataFrame()
+                st.markdown(
+                    f'<div class="ap-column-head"><div class="ap-column-title">{queue}</div>'
+                    f'<div class="ap-count">{len(qdf)}</div></div>',
+                    unsafe_allow_html=True,
+                )
+                with st.container(height=660, border=True):
+                    if qdf.empty:
+                        st.markdown('<div class="ap-empty">Nenhuma demanda aqui.</div>', unsafe_allow_html=True)
+                    else:
+                        for _, row in qdf.iterrows():
+                            render_board_card(row, states.get(str(row.get("Card ID") or "")), queue)
+
+    with detail_area:
+        st.markdown('<div class="ap-section-title">Detalhes da demanda</div>', unsafe_allow_html=True)
+        row = selected_row(filtered, st.session_state.selected_card_id)
+        with st.container(border=True):
+            if row is None:
+                st.info("Selecione uma demanda no quadro para trabalhar nela.")
+            else:
+                render_detail(row, states.get(str(row.get("Card ID") or "")), actor, df_all)
+
+
+# =============================================================================
+# MÓDULO 2 — FLUXO GERAL
+# =============================================================================
 else:
-    if "Dias até prazo" in queue_df.columns:
-        queue_df = queue_df.sort_values("Dias até prazo", ascending=True, na_position="last")
+    st.markdown('<div class="ap-section-title">Fluxo geral</div>', unsafe_allow_html=True)
+    st.caption("Aqui ficam as demandas que não precisam ocupar o Radar principal: pendências de cliente, terceiros e demais etapas do processo.")
 
-    for _, row in queue_df.iterrows():
-        card_id = str(row.get("Card ID") or "")
-        state = states.get(card_id)
-        render_card_summary(row, state)
+    fg1, fg2, fg3 = st.columns([1.4, 1.4, 2])
+    stages = ["Todas"] + sorted([x for x in df_all.get("Etapa Trello", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
+    waits = ["Todos"] + sorted([x for x in df_all.get("Aguardando", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
+    with fg1:
+        stage = st.selectbox("Etapa Trello", stages, key="flow_stage")
+    with fg2:
+        wait = st.selectbox("Aguardando", waits, key="flow_wait")
+    with fg3:
+        search_flow = st.text_input("Buscar demanda", key="flow_search")
 
-        payload = parse_payload((state or {}).get("pending_reason"))
-        saved_items = payload.get("items") or []
-        suggested_items = gaps_to_items(row.get("Possíveis lacunas"))
-        initial_items = saved_items or suggested_items
-        initial_text = "\n".join(f"- {x}" for x in initial_items)
+    flow_df = df_all.copy()
+    if stage != "Todas":
+        flow_df = flow_df[flow_df["Etapa Trello"] == stage]
+    if wait != "Todos":
+        flow_df = flow_df[flow_df["Aguardando"] == wait]
+    if search_flow.strip():
+        q = search_flow.strip().casefold()
+        hay = (flow_df["Demanda"].astype(str) + " " + flow_df["Unidade"].astype(str)).str.casefold()
+        flow_df = flow_df[hay.str.contains(q, regex=False)]
 
-        with st.expander("Definir o que solicitar / decidir próxima ação"):
-            left, right = st.columns([1.05, 1])
-            with left:
-                st.markdown("**Checklist que vai para a cobrança**")
-                st.markdown(
-                    '<div class="ap-form-help">Escreva apenas o que o supervisor precisa responder. Um item por linha.</div>',
-                    unsafe_allow_html=True,
-                )
-                pending_text = st.text_area(
-                    "Informações que precisam ser respondidas",
-                    value=initial_text,
-                    height=170,
-                    key=f"pending_{card_id}",
-                    label_visibility="collapsed",
-                    placeholder="- Altura da pintura\n- Acabamento da tinta\n- Área total em m²",
-                )
-                current_items = split_items(pending_text)
-                st.markdown(
-                    f'<div class="ap-saved"><b>Resumo da cobrança:</b> {escape(summarize_items(current_items))}</div>',
-                    unsafe_allow_html=True,
-                )
+    if flow_df.empty:
+        st.info("Nenhuma demanda com estes filtros.")
+    else:
+        summary = (
+            flow_df.groupby(["Etapa Trello", "Aguardando"], dropna=False)
+            .size()
+            .reset_index(name="Demandas")
+            .sort_values("Demandas", ascending=False)
+        )
+        st.dataframe(summary, use_container_width=True, hide_index=True)
 
-            with right:
-                st.markdown("**Configuração da pendência**")
-                owner_labels = {
-                    "Engenharia / supervisor": "engineering",
-                    "Cliente": "client",
-                    "Fornecedor / prestador": "supplier",
-                    "Especialista": "specialist",
-                }
-                current_owner = str((state or {}).get("pending_owner_type") or "engineering")
-                owner_index = list(owner_labels.values()).index(current_owner) if current_owner in owner_labels.values() else 0
-                owner_label = st.selectbox(
-                    "Quem precisa responder?",
-                    list(owner_labels.keys()),
-                    index=owner_index,
-                    key=f"owner_{card_id}",
-                )
-                note = st.text_input(
-                    "Observação interna (opcional)",
-                    value=str(payload.get("note") or ""),
-                    key=f"note_{card_id}",
-                    placeholder="Ex.: confirmar também com fornecedor de esquadria",
-                )
-                st.markdown(
-                    f'<div class="ap-saved"><b>Vai ficar aguardando:</b> {escape(owner_label)}</div>',
-                    unsafe_allow_html=True,
-                )
-
-            a1, a2, a3 = st.columns([1.4, 1.2, 1])
-            with a1:
-                if st.button("Salvar pendências", type="primary", use_container_width=True, key=f"save_{card_id}"):
-                    ok, msg = save_pending_definition(
-                        card_id=card_id,
-                        items=split_items(pending_text),
-                        owner_type=owner_labels[owner_label],
-                        actor=actor,
-                        supervisor=safe_text(row.get("Engenharia"), ""),
-                        note=note,
-                    )
-                    (st.success if ok else st.error)(msg)
-                    if ok:
-                        st.rerun()
-            with a2:
-                if st.button("Marcar pronto", use_container_width=True, key=f"ready_{card_id}"):
-                    ok, msg = mark_ready(card_id, actor)
-                    (st.success if ok else st.error)(msg)
-                    if ok:
-                        st.rerun()
-            with a3:
-                if st.button("Reabrir", use_container_width=True, key=f"reopen_{card_id}"):
-                    ok, msg = reopen_review(card_id, actor)
-                    (st.success if ok else st.error)(msg)
-                    if ok:
-                        st.rerun()
-
-            with st.expander("Ver contexto do card"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.write("**Próximo passo atual**")
-                    st.write(safe_text(row.get("Pendência / próxima ação")))
-                    st.write("**Sugestão automática de lacunas**")
-                    gaps = suggested_items or ["Nenhuma sugestão automática."]
-                    for item in gaps:
-                        st.write(f"• {item}")
-                with c2:
-                    st.write("**Último retorno da Engenharia**")
-                    st.write(safe_text(row.get("Último retorno Engenharia")))
-                    st.write("**Aguardando / Serviço**")
-                    st.write(f"{safe_text(row.get('Aguardando'))} • {safe_text(row.get('Tipo de serviço'))}")
-                    url = safe_text(row.get("URL"), "")
-                    if url and url != "—":
-                        st.markdown(f"[Abrir no Trello ↗]({url})")
-
-with st.expander("Ver tabela resumida"):
-    cols = [
-        "Demanda",
-        "Unidade",
-        "Engenharia",
-        "Fila",
-        "Etapa Trello",
-        "Aguardando",
-        "Pendência / próxima ação",
-        "Situação do prazo",
-        "Data visita",
-    ]
-    view = filtered[cols].copy() if not filtered.empty else pd.DataFrame(columns=cols)
-    st.dataframe(view, use_container_width=True, hide_index=True)
+        st.markdown("#### Demandas")
+        cols = [
+            "Demanda", "Unidade", "Engenharia", "Etapa Trello", "Aguardando",
+            "Situação do prazo", "Pendência / próxima ação", "URL",
+        ]
+        st.dataframe(flow_df[cols], use_container_width=True, hide_index=True)
