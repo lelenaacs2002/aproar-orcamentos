@@ -233,6 +233,14 @@ ASSIGNMENT_WORDS = {
     "MARCAR", "VISITA", "LEVANTAMENTO", "ORCAR", "ORCAMENTO", "VERIFICAR",
     "EXPLICAR", "INFORMAR", "ENVIAR", "COBRAR", "REALIZAR", "CONFERIR",
     "COMPLEMENTAR", "ACRESCENTAR", "CORRIGIR", "ANEXAR", "COTACAO",
+    # Palavras muito usadas nos comentários reais quando Orçamentos devolve um
+    # card para o supervisor. Elas também ajudam a detectar a atribuição correta.
+    "SOLICITADO", "SOLICITADA", "SOLICITAR", "AGUARDO", "AGUARDANDO",
+    "PENDENTE", "PENDENCIA", "ADEQUACAO", "AJUSTE", "AJUSTAR",
+}
+
+REQUEST_SIGNAL_WORDS = ASSIGNMENT_WORDS | {
+    "PRECISO", "PRECISAMOS", "FALTA", "FALTAM", "INFORMACOES",
 }
 
 
@@ -348,6 +356,14 @@ def engineer_comments(card_actions: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 def office_requests_to_engineer(card_actions: list[dict[str, Any]], engineer: str) -> list[dict[str, Any]]:
+    """
+    Retorna cobranças/devoluções feitas por Orçamentos para Engenharia.
+
+    Importante: no quadro real nem toda cobrança vem em forma de pergunta.
+    Comentários como "No aguardo das informações @gustavo" ou
+    "foi solicitada uma adequação do escopo" também deixam a demanda
+    pendente, mesmo se o card estiver em PARA ELABORAR ORÇAMENTO.
+    """
     output: list[dict[str, Any]] = []
     for action in comment_actions(card_actions):
         if not is_office_author(action) and "GABRIEL" not in norm(comment_author(action)):
@@ -357,7 +373,19 @@ def office_requests_to_engineer(card_actions: list[dict[str, Any]], engineer: st
         if engineer != "Não identificado" and mentions and engineer not in mentions:
             continue
         t = norm(text)
-        looks_like_request = bool(mentions and any(word in t for word in ASSIGNMENT_WORDS)) or "?" in text
+        has_request_signal = any(word in t for word in REQUEST_SIGNAL_WORDS)
+        waiting_for_engineering = (
+            any(x in t for x in [
+                "NO AGUARDO DAS INFORMACOES",
+                "AGUARDANDO INFORMACOES",
+                "AGUARDANDO AS INFORMACOES",
+                "AGUARDO DAS INFORMACOES",
+                "ADEQUACAO DO ESCOPO",
+                "AJUSTE DO ESCOPO",
+            ])
+            and (bool(mentions) or engineer != "Não identificado")
+        )
+        looks_like_request = (bool(mentions) and has_request_signal) or waiting_for_engineering or "?" in text
         if looks_like_request:
             output.append(action)
     return output
@@ -375,6 +403,29 @@ def latest_engineer_response(card_actions: list[dict[str, Any]], engineer: str) 
         if engineer == "Não identificado" or who == engineer:
             return action
     return None
+
+
+def office_ready_signal(card_actions: list[dict[str, Any]]) -> tuple[str | None, datetime | None]:
+    """Detecta uma liberação explícita feita pelo setor de Orçamentos."""
+    ready_phrases = [
+        "LEVANTAMENTO CONFERIDO",
+        "INFORMACOES SUFICIENTES",
+        "INFORMACAO SUFICIENTE",
+        "LIBERADO PARA ELABORACAO",
+        "LIBERADA PARA ELABORACAO",
+        "PODE ELABORAR",
+        "PODE SEGUIR PARA ELABORACAO",
+        "PODE PROSSEGUIR COM O ORCAMENTO",
+        "OK PARA ELABORAR",
+    ]
+    for action in comment_actions(card_actions):
+        if not is_office_author(action):
+            continue
+        text = strip_attachment_markup(comment_text(action))
+        t = norm(text)
+        if any(phrase in t for phrase in ready_phrases):
+            return text[:280], comment_date(action)
+    return None, None
 
 
 # -----------------------------------------------------------------------------
@@ -542,6 +593,11 @@ def unresolved_specific_request(card_actions: list[dict[str, Any]], engineer: st
         if not subsequent:
             if is_generic_visit_request(q_text):
                 return "Agendar/realizar a visita e preencher o levantamento", ["Visita/levantamento ainda sem retorno"], q_dt
+            qt = norm(q_text)
+            if "ADEQUACAO DO ESCOPO" in qt or "AJUSTE DO ESCOPO" in qt:
+                return "Informar a adequação/ajuste de escopo solicitado", ["Adequação do escopo"], q_dt
+            if any(x in qt for x in ["NO AGUARDO DAS INFORMACOES", "AGUARDANDO INFORMACOES", "AGUARDO DAS INFORMACOES"]):
+                return "Enviar as informações solicitadas pelo setor de Orçamentos", ["Informações solicitadas"], q_dt
             return q_text[:280] or "Responder a solicitação do setor de Orçamentos", [], q_dt
 
         answer_text = " \n ".join(comment_text(a) for a in subsequent)
@@ -872,6 +928,7 @@ def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = F
         service, informed, missing, substantive_reply, technical_summary = technical_assessment(card, card_actions)
         specific_pending, specific_missing, specific_request_dt = unresolved_specific_request(card_actions, engineer)
         third_owner, third_note, third_dt = third_party_signal(card_actions)
+        ready_note, ready_dt = office_ready_signal(card_actions)
 
         latest_eng = latest_engineer_response(card_actions, engineer)
         latest_eng_dt = comment_date(latest_eng)
@@ -905,12 +962,48 @@ def analyze_snapshot(snapshot: dict[str, Any], trust_trello_ready_list: bool = F
             waiting = "Orçamentos"
             pending = "Orçamento em elaboração/revisão interna"
         elif list_norm == LISTA_PARA_ELABORAR:
-            waiting = "Orçamentos"
-            if reviewed or trust_trello_ready_list:
+            # A lista, sozinha, NÃO significa que o levantamento está liberado.
+            # Primeiro prevalece o sinal mais recente dos comentários/atividades.
+            # Exemplo real: o card voltou para PARA ELABORAR, mas César escreveu
+            # "No aguardo das informações @gustavo". Nesse caso é cobrança.
+            request_is_newer = bool(
+                specific_pending and specific_request_dt and (not third_dt or specific_request_dt > third_dt)
+            )
+            third_is_current = bool(
+                third_owner and third_dt and (not specific_request_dt or third_dt >= specific_request_dt)
+            )
+            engineer_replied_after_request = bool(
+                latest_eng_dt and (not specific_request_dt or latest_eng_dt > specific_request_dt)
+            )
+
+            if request_is_newer or specific_pending:
+                queue = "Cobrar Engenharia"
+                waiting = "Engenharia"
+                pending = specific_pending or "Responder à solicitação de Orçamentos"
+            elif third_is_current:
+                queue = "Aguardar terceiros"
+                waiting = third_owner or "Terceiro"
+                pending = third_note or f"Aguardando {(third_owner or 'terceiro').lower()}"
+            elif ready_dt and (not specific_request_dt or ready_dt > specific_request_dt) and (not third_dt or ready_dt >= third_dt):
                 queue = "Pronto para elaborar"
-                pending = "Levantamento liberado para elaboração"
-            else:
+                waiting = "Orçamentos"
+                pending = ready_note or "Levantamento explicitamente liberado para elaboração"
+            elif reviewed:
+                queue = "Pronto para elaborar"
+                waiting = "Orçamentos"
+                pending = "Levantamento conferido e liberado para elaboração"
+            elif engineer_replied_after_request or substantive_reply or info_yes:
                 queue = "Conferir retorno"
+                waiting = "Orçamentos"
+                pending = "Conferir retorno recebido"
+                if missing:
+                    pending += f" • possíveis lacunas: {', '.join(missing[:5])}"
+            else:
+                # Fallback seguro: entrar nessa lista do Trello pede conferência,
+                # não uma liberação automática. O parâmetro legado de confiança
+                # é mantido na assinatura apenas por compatibilidade.
+                queue = "Conferir retorno"
+                waiting = "Orçamentos"
                 pending = (
                     "Conferir levantamento antes de liberar"
                     + (f" • possíveis lacunas: {', '.join(missing[:4])}" if missing else "")
