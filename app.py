@@ -168,6 +168,24 @@ div[data-testid="stButton"] > button[kind="primary"] *,div[data-testid="stButton
 [data-testid="stSegmentedControl"] button {{background:var(--surface)!important;border-color:var(--line)!important;color:var(--text)!important;}}
 [data-testid="stSegmentedControl"] button[aria-pressed="true"] {{background:var(--sidebar)!important;color:#fff!important;}}
 [data-testid="stSegmentedControl"] button[aria-pressed="true"] * {{color:#fff!important;}}
+/* Contraste definitivo: os botões escuros da fila sempre usam texto branco. */
+[data-testid="stSegmentedControl"] button {{
+  background:#10243a!important;
+  border-color:#31475d!important;
+  color:#fff!important;
+  -webkit-text-fill-color:#fff!important;
+}}
+[data-testid="stSegmentedControl"] button *,
+[data-testid="stSegmentedControl"] button p,
+[data-testid="stSegmentedControl"] button span {{
+  color:#fff!important;
+  -webkit-text-fill-color:#fff!important;
+  opacity:1!important;
+}}
+[data-testid="stSegmentedControl"] button[aria-pressed="true"] {{
+  background:#2d69dc!important;
+  border-color:#2d69dc!important;
+}}
 
 /* Checkboxes / expanders */
 div[data-testid="stCheckbox"] label span {{color:var(--text)!important;}}
@@ -666,8 +684,12 @@ except Exception as exc:
     st.error(f"Não foi possível carregar o Trello: {exc}")
     st.stop()
 
-trust_ready = bool(secret("TRUST_TRELLO_READY_LIST", False))
-result = analyze_snapshot(snapshot, trust_trello_ready_list=trust_ready)
+# Neste painel, a lista do Trello "PARA ELABORAR ORÇAMENTO" é a fonte operacional
+# para a fila Pronto para elaborar. Um estado interno salvo depois ainda pode
+# devolver a demanda para cobrança, mas um card apenas por estar nessa lista
+# não deve desaparecer do painel.
+trust_ready = True
+result = analyze_snapshot(snapshot, trust_trello_ready_list=True)
 df_all = result.rows.copy()
 states = load_review_states()
 df_all = apply_review_states(df_all, states)
